@@ -28,7 +28,6 @@ install_drivers() {
     # Add NVIDIA CUDA repository for latest drivers
     wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb
     dpkg -i /tmp/cuda-keyring.deb
-    rm -f /tmp/cuda-keyring.deb
     apt modernize-sources || true
     apt update
 
