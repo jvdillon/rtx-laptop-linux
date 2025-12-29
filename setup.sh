@@ -151,8 +151,10 @@ PREREQ=""
 prereqs() { echo "$PREREQ"; }
 case "$1" in prereqs) prereqs; exit 0;; esac
 
-# Remove nvidia modules if they were added
-rm -f "${DESTDIR}/lib/modules/$(uname -r)/kernel/drivers/video/nvidia"* 2>/dev/null || true
+# Remove nvidia modules if they were added (check multiple possible paths)
+rm -f "${DESTDIR}"/lib/modules/*/kernel/drivers/video/nvidia* 2>/dev/null || true
+rm -f "${DESTDIR}"/lib/modules/*/updates/dkms/nvidia* 2>/dev/null || true
+rm -f "${DESTDIR}"/lib/modules/*/kernel/drivers/gpu/nvidia* 2>/dev/null || true
 HOOK
     chmod +x /etc/initramfs-tools/hooks/exclude-nvidia
     # Add i915 for early KMS

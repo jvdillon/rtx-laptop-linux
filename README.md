@@ -177,7 +177,16 @@ Trade-off: first CUDA call has ~1s latency while the driver loads.
 sudo systemctl disable nvidia-persistenced
 ```
 
-### 10. Disable nvidia-settings Autostart
+### 10. Enable nvidia suspend/hibernate/resume Services
+
+These official NVIDIA services handle saving/restoring GPU state across
+suspend and hibernate:
+
+```bash
+sudo systemctl enable nvidia-suspend nvidia-hibernate nvidia-resume
+```
+
+### 11. Disable nvidia-settings Autostart
 
 `nvidia-settings` spawns at login and keeps `/dev/nvidia*` open, preventing
 D3cold.
@@ -189,7 +198,7 @@ Type=Application
 Hidden=true
 ```
 
-### 11. Prevent Chrome from Waking GPU
+### 12. Prevent Chrome from Waking GPU
 
 Chrome probes `/dev/nvidiactl` at startup even when not using GPU acceleration.
 Force it to use Mesa:
@@ -199,13 +208,22 @@ sudo sed -i 's|^Exec=/usr/bin/google-chrome-stable|Exec=env __NV_PRIME_RENDER_OF
     /usr/share/applications/google-chrome.desktop
 ```
 
-### 12. Configure TLP (if installed)
+### 13. Configure TLP (if installed)
 
 TLP defaults to `RUNTIME_PM_ON_AC=on` which forces all devices awake on AC
 power:
 
 ```bash
 sudo sed -i '/^#*RUNTIME_PM_ON_AC/d; $ a RUNTIME_PM_ON_AC="auto"' /etc/tlp.conf
+```
+
+### 14. Rebuild initramfs
+
+Apply the initramfs changes (nvidia exclusion, early i915):
+
+```bash
+sudo update-initramfs -u  # Ubuntu 24.04
+sudo dracut --force       # Ubuntu 25.04+
 ```
 
 ## Verification
@@ -277,14 +295,17 @@ hibernate instead - hybrid-sleep is fundamentally broken with these drivers.
 
 ## Finding Your GPU PCI Address
 
-The scripts assume `0000:01:00.0`. Find yours with:
+The setup script **auto-detects** your GPU PCI address. The examples in this
+README use `0000:01:00.0` for illustration.
+
+To find yours manually:
 
 ```bash
-lspci | grep -i nvidia
-# Example output: 01:00.0 3D controller: NVIDIA Corporation...
+lspci -D | grep -i nvidia
+# Example output: 0000:01:00.0 3D controller: NVIDIA Corporation...
 ```
 
-If different, update the PCI address in:
+If you need to update the systemd services manually, edit:
 - `/etc/systemd/system/nvidia-wake.service`
 - `/etc/systemd/system/nvidia-power-control.service`
 - `/etc/systemd/system/nvidia-resume.service.d/restore-pm.conf`
