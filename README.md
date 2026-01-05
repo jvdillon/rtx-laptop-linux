@@ -1,4 +1,4 @@
-# RTX Laptop Linux Power Management
+# Nvidia RTX Laptop Linux Power Management
 
 Get proper battery life on Linux laptops with NVIDIA RTX GPUs.
 
