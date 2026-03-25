@@ -10,6 +10,21 @@
 #   6. [1] also does nvidia-smi -r (GPU reset), but that only works on
 #      datacenter GPUs (Tesla, A100, etc.), not consumer cards.
 #
+# Dependency model — what holds what:
+#
+#   Module refcounts are held by:
+#     nvidia       ← /dev/nvidia* fd holders (CUDA), persistence mode, nvidia_modeset
+#     nvidia_modeset ← nvidia_drm
+#     nvidia_drm   ← /dev/dri/card* fd holders (compositor, Xorg, DRM clients)
+#     nvidia_uvm   ← /dev/nvidia-uvm fd holders (unified memory / CUDA)
+#
+#   Unload order (dependents first): nvidia_uvm → nvidia_drm → nvidia_modeset → nvidia
+#
+#   After module reload, device nodes (/dev/nvidia*) are created asynchronously
+#   by udev. Services like nvidia-persistenced need them to exist before starting.
+#   The cleanup trap runs udevadm settle before restarting services to avoid this
+#   race on both success and failure (e.g. set -e after partial modprobe reload).
+#
 # The hard part — nvidia_drm refcount:
 #   modprobe -r fails if anything holds a reference to nvidia_drm. On headless
 #   systems, killing compute processes and /dev/nvidia* users is sufficient.
@@ -43,7 +58,6 @@
 #   - Kill compute processes individually rather than blindly
 #   - Partial unload recovery (re-loads modules if unload fails halfway)
 #   - Skip DM restart if driver reload failed (avoids login loop)
-#   - Wait for udev device nodes after module reload (avoids persistenced race)
 #
 # [1] https://docs.northerndata.eu/docs/how-to-reset-gpus-on-a-running-instance
 # [2] https://forums.developer.nvidia.com/t/reset-driver-without-rebooting-on-linux/40625
@@ -94,6 +108,13 @@ cleanup() {
             systemctl start "$svc" || echo "WARNING: Failed to start $svc"
         done
         return
+    fi
+    # Services like nvidia-persistenced need /dev/nvidia* to exist. Device nodes
+    # are created asynchronously by udev after module load, so wait for udev to
+    # finish before restarting anything. This runs on both success and failure
+    # paths (e.g. set -e exit after partial modprobe reload).
+    if lsmod | grep -q "^nvidia "; then
+        udevadm settle --timeout=10
     fi
     # Reverse order to respect dependencies
     for ((i=${#STOPPED_SERVICES[@]}-1; i>=0; i--)); do
@@ -183,9 +204,9 @@ if [ -n "$DM" ]; then
 fi
 
 echo "Unloading NVIDIA drivers"
-# Wait for killed processes to fully exit so they release module refcounts.
-# kill -9 is immediate but the process may linger in zombie state with fds open
-# until its parent reaps it. /proc/PID disappearing confirms the fd is closed.
+# Wait for any processes still holding nvidia device fds. Processes stuck in
+# TASK_UNINTERRUPTIBLE inside the nvidia driver (e.g. pending DMA) won't die
+# immediately on SIGKILL — they exit once the driver operation completes.
 for pid in $(fuser /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools 2>/dev/null | grep -oE '[0-9]+'); do
     echo "Waiting for PID $pid to exit..."
     timeout 10 tail --pid="$pid" -f /dev/null 2>/dev/null || echo "WARNING: PID $pid did not exit"
@@ -200,8 +221,10 @@ for mod in "${NVIDIA_MODULES[@]}"; do
             refcnt=$(awk -v m="$mod" '$1==m {print $3}' /proc/modules)
             holders=$(ls /sys/module/"$mod"/holders/ 2>/dev/null | tr '\n' ' ')
             echo "WARNING: Failed to unload $mod (refcnt=$refcnt holders=$holders), retrying..."
-            # Kill anything still holding nvidia devices that we missed
+            # Kill anything still holding refs that we missed. nvidia_drm refs
+            # come from /dev/dri/card* (DRM clients), not /dev/nvidia* (CUDA).
             fuser -k /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools 2>/dev/null || true
+            fuser -k /dev/dri/card[0-9]* /dev/dri/renderD[0-9]* 2>/dev/null || true
             # Wait for refcount to actually drop (up to 10s)
             for _retry in $(seq 1 50); do
                 refcnt=$(awk -v m="$mod" '$1==m {print $3}' /proc/modules)
@@ -234,15 +257,6 @@ modprobe nvidia_modeset
 modprobe nvidia_drm
 modprobe nvidia_uvm
 
-# Wait for udev to create device nodes — nvidia-persistenced needs them.
-# udevadm settle blocks until all udev events triggered by modprobe are processed,
-# which includes creating /dev/nvidia*. No poll loop needed.
-echo "Waiting for /dev/nvidia* device nodes..."
-udevadm settle --timeout=10
-if [ ! -e /dev/nvidiactl ]; then
-    echo "WARNING: /dev/nvidia* device nodes not created after module reload"
-fi
-
 if false; then
     TEST_GPU="${1:-0}"
     echo "Testing GPU $TEST_GPU with PyTorch"
@@ -262,4 +276,3 @@ nvidia-smi \
     --format=csv
 
 # Services restarted by EXIT trap
-# Verify they started successfully after trap runs
