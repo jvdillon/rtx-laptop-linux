@@ -43,6 +43,7 @@
 #   - Kill compute processes individually rather than blindly
 #   - Partial unload recovery (re-loads modules if unload fails halfway)
 #   - Skip DM restart if driver reload failed (avoids login loop)
+#   - Wait for udev device nodes after module reload (avoids persistenced race)
 #
 # [1] https://docs.northerndata.eu/docs/how-to-reset-gpus-on-a-running-instance
 # [2] https://forums.developer.nvidia.com/t/reset-driver-without-rebooting-on-linux/40625
@@ -62,6 +63,14 @@ LOG="/tmp/gpu-reset-${TS}.log"
 
 exec > >(tee -a "$LOG") 2>&1
 echo "Logging to $LOG"
+
+# Log version mismatch if present (driver package upgraded but module not yet reloaded)
+LOADED_VER=$(cat /sys/module/nvidia/version 2>/dev/null || echo "")
+INSTALLED_VER=$(modinfo -F version nvidia 2>/dev/null || echo "")
+if [ -n "$LOADED_VER" ] && [ -n "$INSTALLED_VER" ] && [ "$LOADED_VER" != "$INSTALLED_VER" ]; then
+    echo "Driver version mismatch: loaded=$LOADED_VER installed=$INSTALLED_VER"
+    echo "Will hot-swap to $INSTALLED_VER"
+fi
 
 STOPPED_SERVICES=()
 
@@ -168,13 +177,19 @@ nvidia-smi -pm 0 2>/dev/null || true
 pkill -9 -f "watch.*nvidia-smi" 2>/dev/null || true
 fuser -k /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools 2>/dev/null || true
 
+
 if [ -n "$DM" ]; then
     stop_service "$DM"
-    sleep 2
 fi
 
 echo "Unloading NVIDIA drivers"
-sleep 1
+# Wait for killed processes to fully exit so they release module refcounts.
+# kill -9 is immediate but the process may linger in zombie state with fds open
+# until its parent reaps it. /proc/PID disappearing confirms the fd is closed.
+for pid in $(fuser /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools 2>/dev/null | grep -oE '[0-9]+'); do
+    echo "Waiting for PID $pid to exit..."
+    timeout 10 tail --pid="$pid" -f /dev/null 2>/dev/null || echo "WARNING: PID $pid did not exit"
+done
 # Unload each module individually so a partial failure doesn't leave a broken stack
 NVIDIA_MODULES=(nvidia_uvm nvidia_drm nvidia_modeset nvidia)
 UNLOADED_MODULES=()
@@ -182,8 +197,17 @@ unload_failed=false
 for mod in "${NVIDIA_MODULES[@]}"; do
     if lsmod | grep -q "^${mod} "; then
         if ! modprobe -r "$mod" 2>/dev/null; then
-            echo "WARNING: Failed to unload $mod, retrying..."
-            sleep 2
+            refcnt=$(awk -v m="$mod" '$1==m {print $3}' /proc/modules)
+            holders=$(ls /sys/module/"$mod"/holders/ 2>/dev/null | tr '\n' ' ')
+            echo "WARNING: Failed to unload $mod (refcnt=$refcnt holders=$holders), retrying..."
+            # Kill anything still holding nvidia devices that we missed
+            fuser -k /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools 2>/dev/null || true
+            # Wait for refcount to actually drop (up to 10s)
+            for _retry in $(seq 1 50); do
+                refcnt=$(awk -v m="$mod" '$1==m {print $3}' /proc/modules)
+                [ "${refcnt:-1}" = "0" ] && break
+                sleep 0.2
+            done
             if ! modprobe -r "$mod"; then
                 echo "FATAL: Cannot unload $mod"
                 unload_failed=true
@@ -210,6 +234,15 @@ modprobe nvidia_modeset
 modprobe nvidia_drm
 modprobe nvidia_uvm
 
+# Wait for udev to create device nodes — nvidia-persistenced needs them.
+# udevadm settle blocks until all udev events triggered by modprobe are processed,
+# which includes creating /dev/nvidia*. No poll loop needed.
+echo "Waiting for /dev/nvidia* device nodes..."
+udevadm settle --timeout=10
+if [ ! -e /dev/nvidiactl ]; then
+    echo "WARNING: /dev/nvidia* device nodes not created after module reload"
+fi
+
 if false; then
     TEST_GPU="${1:-0}"
     echo "Testing GPU $TEST_GPU with PyTorch"
@@ -229,3 +262,4 @@ nvidia-smi \
     --format=csv
 
 # Services restarted by EXIT trap
+# Verify they started successfully after trap runs
