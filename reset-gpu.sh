@@ -66,13 +66,19 @@
 # [4] systemd-run(1) — run as a transient service to outlive the calling session
 set -e
 
+# Compositor process names — used to detect whether DM stop is needed and to
+# skip killing display servers during targeted compute-process cleanup.
+# "composit" prefix-matches "compositor" (Weston reference binary).
+# "X" matches the traditional Xorg binary name on some distros.
+COMPOSITOR_RE='^(Xorg|Xwayland|X|gnome-shell|kwin|mutter|composit|weston|sway|hyprland|picom).*$'
+
 # Re-exec with sudo if not root
 if [ "$EUID" -ne 0 ]; then
     echo "Re-executing with sudo..."
     exec sudo "$0" "$@"
 fi
 
-TS="${TS:-$(date +%s)}"
+TS="${TS:-$(date +%s%N)}"
 LOG="/tmp/gpu-reset-${TS}.log"
 
 exec > >(tee -a "$LOG") 2>&1
@@ -97,7 +103,7 @@ stop_service() {
 
 cleanup() {
     # Don't restart DM if driver isn't loaded — avoids login loop
-    if [ -n "$DM" ] && ! (lsmod | grep -q "^nvidia "); then
+    if [ -n "$DM" ] && ! lsmod | grep -q "^nvidia "; then
         echo "WARNING: NVIDIA driver not loaded, skipping DM restart to avoid login loop"
         echo "Run 'modprobe nvidia && systemctl start $DM' manually after fixing."
         # Still restart non-DM services
@@ -125,16 +131,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Detect if DM stop will be needed (before stopping any services)
+# Detect if DM stop will be needed (before stopping any services).
+# First check nvidia-smi compute list (fast path — catches compositors doing CUDA
+# compute, e.g. gnome-shell), then fall through to fuser on DRM nodes (catches
+# compositors holding DRM fds without CUDA, e.g. hybrid GPU setups).
 if [ -z "$DM" ]; then
     if PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); then
         echo "Checking GPU processes"
         for pid in $PIDS; do
             PROC=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
-            if [[ "$PROC" =~ ^(Xorg|X|gnome-shell|kwin|mutter|composit|weston|sway|hyprland|picom).*$ ]]; then
+            if [[ "$PROC" =~ $COMPOSITOR_RE ]]; then
                 echo "Display server PID $pid ($PROC) using GPU"
                 DM=$(systemctl list-units --type=service --state=running |
-                    grep -oP '(gdm3?|lightdm|sddm|xdm)\.service' |
+                    grep -oP '(gdm3?|lightdm|sddm|xdm|greetd|lxdm)\.service' |
                     head -1 || echo "")
                 break
             fi
@@ -153,10 +162,10 @@ if [ -z "$DM" ]; then
             carddev="/dev/dri/$(basename "$card")"
             for pid in $(fuser "$carddev" 2>/dev/null | grep -oE '[0-9]+'); do
                 PROC=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
-                if [[ "$PROC" =~ ^(Xorg|X|gnome-shell|kwin|mutter|composit|weston|sway|hyprland|picom).*$ ]]; then
+                if [[ "$PROC" =~ $COMPOSITOR_RE ]]; then
                     echo "Display server PID $pid ($PROC) holding GPU DRM: $carddev"
                     DM=$(systemctl list-units --type=service --state=running |
-                        grep -oP '(gdm3?|lightdm|sddm|xdm)\.service' |
+                        grep -oP '(gdm3?|lightdm|sddm|xdm|greetd|lxdm)\.service' |
                         head -1 || echo "")
                     break 2
                 fi
@@ -165,7 +174,10 @@ if [ -z "$DM" ]; then
     fi
 fi
 
-# Re-exec via systemd if we'll stop DM (to survive session termination)
+# Re-exec via systemd if we'll stop DM (to survive session termination).
+# INVOCATION_ID is set by any systemd service, not just our transient unit.
+# This means invocation from a systemd timer/service skips re-exec, which is
+# fine — those contexts already survive DM teardown.
 if [ -n "$DM" ] && [ -z "$INVOCATION_ID" ]; then
     SCRIPT=$(readlink -f "$0")
     exec systemd-run --no-ask-password --unit="gpu-reset-${TS}" --service-type=oneshot \
@@ -184,7 +196,7 @@ stop_service dcgm
 if PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); then
     for pid in $PIDS; do
         PROC=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
-        if [[ ! "$PROC" =~ ^(Xorg|X|gnome-shell|kwin|mutter|composit|weston|sway|hyprland|picom).*$ ]]; then
+        if [[ ! "$PROC" =~ $COMPOSITOR_RE ]]; then
             echo "Killing compute process PID $pid ($PROC)"
             kill -9 "$pid" 2>/dev/null || true
         fi
@@ -194,14 +206,15 @@ fi
 # Disable persistence mode so driver can unload
 nvidia-smi -pm 0 2>/dev/null || true
 
-# Kill any remaining GPU processes
+# Kill non-compositor GPU processes
 pkill -9 -f "watch.*nvidia-smi" 2>/dev/null || true
-fuser -k /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools 2>/dev/null || true
-
 
 if [ -n "$DM" ]; then
     stop_service "$DM"
 fi
+
+# Now that the DM is stopped, kill anything still holding nvidia device fds.
+fuser -k /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools 2>/dev/null || true
 
 echo "Unloading NVIDIA drivers"
 # Wait for any processes still holding nvidia device fds. Processes stuck in
@@ -217,18 +230,24 @@ UNLOADED_MODULES=()
 unload_failed=false
 for mod in "${NVIDIA_MODULES[@]}"; do
     if lsmod | grep -q "^${mod} "; then
-        if ! modprobe -r "$mod" 2>/dev/null; then
+        if ! modprobe -r "$mod"; then
             refcnt=$(awk -v m="$mod" '$1==m {print $3}' /proc/modules)
             holders=$(ls /sys/module/"$mod"/holders/ 2>/dev/null | tr '\n' ' ')
             echo "WARNING: Failed to unload $mod (refcnt=$refcnt holders=$holders), retrying..."
             # Kill anything still holding refs that we missed. nvidia_drm refs
             # come from /dev/dri/card* (DRM clients), not /dev/nvidia* (CUDA).
+            # Only kill holders of NVIDIA DRM nodes, not Intel/AMD integrated GPU.
             fuser -k /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools 2>/dev/null || true
-            fuser -k /dev/dri/card[0-9]* /dev/dri/renderD[0-9]* 2>/dev/null || true
+            for card in /sys/class/drm/card[0-9]*; do
+                [[ "$(basename "$card")" =~ ^card[0-9]+$ ]] || continue
+                drv=$(readlink "$card/device/driver" 2>/dev/null | xargs basename 2>/dev/null)
+                [ "$drv" = "nvidia" ] || continue
+                fuser -k "/dev/dri/$(basename "$card")" 2>/dev/null || true
+            done
             # Wait for refcount to actually drop (up to 10s)
             for _retry in $(seq 1 50); do
                 refcnt=$(awk -v m="$mod" '$1==m {print $3}' /proc/modules)
-                [ "${refcnt:-1}" = "0" ] && break
+                [ "${refcnt:-0}" = "0" ] && break
                 sleep 0.2
             done
             if ! modprobe -r "$mod"; then
@@ -245,7 +264,8 @@ done
 if $unload_failed; then
     echo "Restoring partially unloaded modules..."
     for ((i=${#UNLOADED_MODULES[@]}-1; i>=0; i--)); do
-        modprobe "${UNLOADED_MODULES[i]}" 2>/dev/null || true
+        modprobe "${UNLOADED_MODULES[i]}" 2>/dev/null \
+            || echo "WARNING: Failed to reload ${UNLOADED_MODULES[i]} — reboot may be required"
     done
     echo "FATAL: GPU reset failed — could not unload all modules"
     exit 1
@@ -257,6 +277,7 @@ modprobe nvidia_modeset
 modprobe nvidia_drm
 modprobe nvidia_uvm
 
+# Debug: uncomment to smoke-test GPU after reset
 if false; then
     TEST_GPU="${1:-0}"
     echo "Testing GPU $TEST_GPU with PyTorch"
@@ -270,9 +291,10 @@ print('GPU works!')
 PYEOF
 fi
 
+udevadm settle --timeout=10
 echo "GPU Status"
 nvidia-smi \
     --query-gpu=index,power.draw,utilization.gpu,fan.speed,pstate \
-    --format=csv
+    --format=csv || true
 
 # Services restarted by EXIT trap
