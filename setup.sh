@@ -75,8 +75,11 @@ fi
 if ! grep -q "__EGL_VENDOR_LIBRARY_FILENAMES" /etc/environment 2>/dev/null; then
     cat >> /etc/environment << 'EOF'
 
-# Force Mesa/Intel for EGL, prevent nvidia from being used by gnome-shell
+# Force Mesa/Intel for EGL/GLX, prevent nvidia from being used by gnome-shell
+# and Chrome (including PWAs launched outside the patched system .desktop).
 __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+__NV_PRIME_RENDER_OFFLOAD=0
+__GLX_VENDOR_LIBRARY_NAME=mesa
 EOF
     echo "[2/14] Added Mesa EGL environment variable"
 else
@@ -218,17 +221,22 @@ chown -R "$REAL_USER:$REAL_USER" "$AUTOSTART_DIR"
 echo "[11/14] Disabled nvidia-settings autostart"
 
 # 12. Prevent Chrome from waking GPU
-CHROME_DESKTOP="/usr/share/applications/google-chrome.desktop"
-if [[ -f "$CHROME_DESKTOP" ]]; then
-    if ! grep -q "__NV_PRIME_RENDER_OFFLOAD=0" "$CHROME_DESKTOP"; then
-        sed -i 's|^Exec=/usr/bin/google-chrome-stable|Exec=env __NV_PRIME_RENDER_OFFLOAD=0 __GLX_VENDOR_LIBRARY_NAME=mesa /usr/bin/google-chrome-stable|' "$CHROME_DESKTOP"
-        echo "[12/14] Patched Chrome to use Mesa"
-    else
-        echo "[12/14] Chrome already patched (skipped)"
-    fi
-else
-    echo "[12/14] Chrome not installed (skipped)"
-fi
+# Superseded by step 2: __NV_PRIME_RENDER_OFFLOAD and __GLX_VENDOR_LIBRARY_NAME
+# are now set in /etc/environment, which covers PWA launchers and any other
+# Chrome entry point. The per-.desktop patch below also gets wiped by every
+# google-chrome-stable apt upgrade, so it's not worth maintaining.
+# CHROME_DESKTOP="/usr/share/applications/google-chrome.desktop"
+# if [[ -f "$CHROME_DESKTOP" ]]; then
+#     if ! grep -q "__NV_PRIME_RENDER_OFFLOAD=0" "$CHROME_DESKTOP"; then
+#         sed -i 's|^Exec=/usr/bin/google-chrome-stable|Exec=env __NV_PRIME_RENDER_OFFLOAD=0 __GLX_VENDOR_LIBRARY_NAME=mesa /usr/bin/google-chrome-stable|' "$CHROME_DESKTOP"
+#         echo "[12/14] Patched Chrome to use Mesa"
+#     else
+#         echo "[12/14] Chrome already patched (skipped)"
+#     fi
+# else
+#     echo "[12/14] Chrome not installed (skipped)"
+# fi
+echo "[12/14] Chrome bypass handled via /etc/environment (step 2)"
 
 # 13. Configure TLP (if installed)
 if [[ -f /etc/tlp.conf ]]; then
