@@ -54,8 +54,10 @@ fi
 # Power Management Setup
 # ------------------------------------------------------------------------------
 
-# Detect NVIDIA GPU PCI address
-GPU_PCI=$(lspci -D | grep -i 'nvidia.*3d\|nvidia.*vga' | head -1 | awk '{print $1}')
+# Detect NVIDIA GPU PCI address.
+# lspci prints "<addr> 3D controller: NVIDIA ..." -- the class precedes the
+# vendor, so a 'nvidia.*3d' pattern never matches. Match either order.
+GPU_PCI=$(lspci -D | grep -iE '(3d|vga)[^:]*controller.*nvidia|nvidia.*(3d|vga)' | head -1 | awk '{print $1}')
 if [[ -z "$GPU_PCI" ]]; then
     echo "Error: No NVIDIA GPU found"
     exit 1
@@ -64,11 +66,30 @@ echo "Found NVIDIA GPU at: $GPU_PCI"
 echo ""
 
 # 1. Demote NVIDIA EGL priority
-if [[ -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json ]]; then
-    mv /usr/share/glvnd/egl_vendor.d/{10,90}_nvidia.json
-    echo "[1/14] Demoted NVIDIA EGL priority"
+# libglvnd loads EGL vendor JSONs in filename order; 10_nvidia.json wins over
+# 50_mesa.json, so the desktop renders on (and wakes) the dGPU. A plain
+# `mv 10->90` is NOT durable: libnvidia-gl upgrades RE-CREATE 10_nvidia.json,
+# silently undoing the demotion (and a second mv then fails because 90_ exists).
+# Use dpkg-divert so the package's own 10_nvidia.json is permanently redirected
+# and never reappears at the winning filename across upgrades.
+EGL_DIR=/usr/share/glvnd/egl_vendor.d
+if ! dpkg-divert --list "$EGL_DIR/10_nvidia.json" | grep -q .; then
+    # The divert renames 10_nvidia.json -> 90_nvidia.json. A prior manual
+    # `mv 10->90` (plus a driver upgrade re-creating 10_) can leave BOTH files
+    # present; dpkg-divert then refuses ("rename involves overwriting 90_").
+    # 90_ is a byte-identical copy of the package's 10_, so remove the stale 90_
+    # to free the rename target before diverting.
+    if [[ -f "$EGL_DIR/10_nvidia.json" && -f "$EGL_DIR/90_nvidia.json" ]]; then
+        rm -f "$EGL_DIR/90_nvidia.json"
+    elif [[ ! -f "$EGL_DIR/10_nvidia.json" && -f "$EGL_DIR/90_nvidia.json" ]]; then
+        # Only the renamed copy exists: restore it so divert --rename can act.
+        mv "$EGL_DIR/90_nvidia.json" "$EGL_DIR/10_nvidia.json"
+    fi
+    dpkg-divert --add --rename --divert "$EGL_DIR/90_nvidia.json" \
+        "$EGL_DIR/10_nvidia.json"
+    echo "[1/14] Demoted NVIDIA EGL priority (dpkg-divert 10->90, upgrade-proof)"
 else
-    echo "[1/14] NVIDIA EGL priority already demoted (skipped)"
+    echo "[1/14] NVIDIA EGL already diverted (skipped)"
 fi
 
 # 2. Force Mesa EGL system-wide
@@ -86,16 +107,38 @@ else
     echo "[2/14] Mesa EGL environment variable already set (skipped)"
 fi
 
-# 3. Disable NVIDIA DRM modesetting
-if [[ -f /etc/modprobe.d/nvidia-graphics-drivers-kms.conf ]]; then
-    if grep -q "modeset=1" /etc/modprobe.d/nvidia-graphics-drivers-kms.conf; then
-        sed -i 's/modeset=1/modeset=0/' /etc/modprobe.d/nvidia-graphics-drivers-kms.conf
-        echo "[3/14] Disabled NVIDIA DRM modesetting"
-    else
-        echo "[3/14] NVIDIA DRM modesetting already disabled (skipped)"
-    fi
+# 3. Disable NVIDIA DRM modesetting (headless/compute-only dGPU)
+#
+# The dGPU drives no display connectors here (all eDP/DP/HDMI are on the Intel
+# iGPU), so KMS exists only to expose /dev/dri/card0+renderD129 for the desktop
+# to probe -- which we don't want. CUDA uses /dev/nvidia* directly and is
+# unaffected by modeset.
+#
+# IMPORTANT: ubuntu-drivers ships /usr/lib/modprobe.d/nvidia-kms.conf with
+# `modeset=1`. modprobe merges all *.conf across /etc and /usr/lib, sorts by
+# FILENAME, and for a repeated option LAST-wins. A differently-named file in
+# /etc does NOT override it: e.g. nvidia-graphics-drivers-kms.conf ("g") sorts
+# BEFORE nvidia-kms.conf ("k"), so the /usr/lib modeset=1 wins regardless.
+# The only deterministic override is a SAME-BASENAME file in /etc, which fully
+# shadows the /usr/lib copy. So we write /etc/modprobe.d/nvidia-kms.conf.
+KMS_SHADOW=/etc/modprobe.d/nvidia-kms.conf
+if [[ ! -f "$KMS_SHADOW" ]] || ! grep -q '^options nvidia-drm modeset=0' "$KMS_SHADOW"; then
+    cat > "$KMS_SHADOW" << 'EOF'
+# Shadows /usr/lib/modprobe.d/nvidia-kms.conf (ubuntu-drivers, modeset=1).
+# Same basename -> /etc copy fully replaces the /usr/lib one. Headless dGPU:
+# no display connectors on nvidia, so KMS is unwanted. CUDA is unaffected.
+options nvidia-drm modeset=0
+EOF
+    echo "[3/14] Disabled NVIDIA DRM modesetting (shadow $KMS_SHADOW)"
 else
-    echo "[3/14] No nvidia-graphics-drivers-kms.conf found (skipped)"
+    echo "[3/14] NVIDIA DRM modesetting already disabled (skipped)"
+fi
+# Neutralize the legacy differently-named file so it can't add a stray
+# conflicting directive (its modeset value no longer matters, but keep clean).
+LEGACY_KMS=/etc/modprobe.d/nvidia-graphics-drivers-kms.conf
+if [[ -f "$LEGACY_KMS" ]] && grep -q 'modeset=1' "$LEGACY_KMS"; then
+    sed -i 's/modeset=1/modeset=0/' "$LEGACY_KMS"
+    echo "       (also set modeset=0 in legacy $LEGACY_KMS)"
 fi
 
 # 4. Fix nv_open_q CPU spin bug
@@ -205,6 +248,36 @@ else
     echo "[9/14] nvidia-persistenced already disabled (skipped)"
 fi
 
+# 9b. Disable nvidia-powerd (Dynamic Boost daemon)
+# This laptop's SBIOS does not expose the NVPCF ACPI interface and actively
+# requests Dynamic Boost be disabled (powerd logs: "Client (presumably SBIOS)
+# has requested to disable Dynamic Boost DC controller"). With powerd running,
+# it polls this dead interface and floods the journal every ~22s with:
+#   NVRM: GPU0 ... PRH failed to update thermal limit! @ platform_request_handler.c
+# Dynamic Boost only rebalances CPU<->GPU watts while the GPU is active; it is
+# useless for sustained compute and unavailable here regardless. Masking it
+# removes the every-22s flood and releases the device handle.
+#
+# NOTE: masking powerd does NOT eliminate PRH messages entirely. The driver
+# itself still probes the SBIOS thermal interface at init and on each D3cold
+# wake, so a few PRH lines per boot remain (clustered at boot/wake, not the
+# periodic flood). These are benign and unavoidable: there is no driver flag to
+# disable the PlatformRequestHandler (modinfo nvidia exposes none), and the true
+# fix is an LG BIOS that exposes NVPCF. D3cold/battery and suspend use separate
+# subsystems and are unaffected.
+#
+# Use `mask`, not `disable`: the nvidia driver package ships a systemd preset
+# (70-nvidia-driver.preset) that re-enables nvidia-powerd on every driver
+# upgrade. `disable` only removes the symlink and is silently undone by the next
+# `systemctl preset`. `mask` points the unit at /dev/null and survives presets
+# and upgrades -- the durable form.
+if [[ "$(systemctl is-enabled nvidia-powerd 2>/dev/null)" != "masked" ]]; then
+    systemctl mask --now nvidia-powerd
+    echo "[9b/14] Masked nvidia-powerd (SBIOS refuses Dynamic Boost; upgrade-proof)"
+else
+    echo "[9b/14] nvidia-powerd already masked (skipped)"
+fi
+
 # 10. Enable nvidia suspend/hibernate/resume services
 systemctl enable nvidia-suspend nvidia-hibernate nvidia-resume 2>/dev/null || true
 echo "[10/14] Enabled nvidia suspend/hibernate/resume services"
@@ -260,7 +333,10 @@ echo ""
 echo "=========================================="
 echo "Setup complete! Reboot to apply changes."
 echo ""
-echo "After reboot, verify with:"
-echo "  cat /sys/bus/pci/devices/${GPU_PCI}/power/runtime_status"
-echo "  # Should show 'suspended' when GPU is idle"
+echo "After reboot, verify:"
+echo "  cat /sys/bus/pci/devices/${GPU_PCI}/power/runtime_status  # 'suspended' when idle"
+echo "  sudo cat /sys/module/nvidia_drm/parameters/modeset        # N (modesetting off)"
+echo "  dpkg-divert --list '*10_nvidia*'                          # divert listed"
+echo "  systemctl is-enabled nvidia-powerd                       # masked"
+echo "  journalctl -k -b | grep -c UNLOADING_GUEST_DRIVE          # 0 = no GPU fall-off"
 echo "=========================================="

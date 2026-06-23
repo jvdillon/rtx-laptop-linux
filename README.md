@@ -42,11 +42,16 @@ The script will:
 
 ### 1. Demote NVIDIA EGL Priority
 
-libglvnd loads EGL vendors by filename order. Renaming `10_nvidia.json` to
-`90_nvidia.json` ensures Mesa (Intel/AMD integrated) loads first.
+libglvnd loads EGL vendors by filename order; `10_nvidia.json` wins over
+`50_mesa.json`, so the desktop renders on (and wakes) the dGPU. A plain rename
+is **not durable**: `libnvidia-gl` upgrades re-create `10_nvidia.json`, silently
+undoing the demotion. Use `dpkg-divert` so the package's own file is permanently
+redirected and never reappears at the winning filename across upgrades.
 
 ```bash
-sudo mv /usr/share/glvnd/egl_vendor.d/{10,90}_nvidia.json
+sudo dpkg-divert --add --rename \
+    --divert /usr/share/glvnd/egl_vendor.d/90_nvidia.json \
+    /usr/share/glvnd/egl_vendor.d/10_nvidia.json
 ```
 
 ### 2. Force Mesa EGL System-Wide
@@ -61,12 +66,25 @@ __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
 
 ### 3. Disable NVIDIA DRM Modesetting
 
-With `modeset=1`, nvidia_drm takes over the display, preventing Intel from
-driving the panel. This also causes Plymouth hangs during boot.
+The dGPU drives no display connectors (all eDP/DP/HDMI are on the Intel iGPU),
+so KMS only exposes `/dev/dri/card0`+`renderD129` for the desktop to probe.
+CUDA uses `/dev/nvidia*` directly and is unaffected by modeset.
+
+**Gotcha:** `ubuntu-drivers` ships `/usr/lib/modprobe.d/nvidia-kms.conf` with
+`modeset=1`. modprobe merges all `*.conf` across `/etc` and `/usr/lib`, sorts by
+**filename**, and for a repeated option **last-wins**. A *differently-named*
+file in `/etc` does not override it — `nvidia-graphics-drivers-kms.conf` ("g")
+sorts before `nvidia-kms.conf` ("k"), so the `/usr/lib` `modeset=1` wins. The
+only deterministic override is a **same-basename** file in `/etc`, which fully
+shadows the `/usr/lib` copy.
 
 ```bash
-sudo sed -i 's/modeset=1/modeset=0/' /etc/modprobe.d/nvidia-graphics-drivers-kms.conf
+# Same basename as /usr/lib/modprobe.d/nvidia-kms.conf -> /etc copy replaces it
+echo 'options nvidia-drm modeset=0' | sudo tee /etc/modprobe.d/nvidia-kms.conf
+sudo update-initramfs -u
 ```
+
+Verify after reboot: `cat /sys/module/nvidia_drm/parameters/modeset` -> `N`.
 
 ### 4. Fix nv_open_q CPU Spin Bug
 
@@ -175,6 +193,38 @@ Trade-off: first CUDA call has ~1s latency while the driver loads.
 
 ```bash
 sudo systemctl disable nvidia-persistenced
+```
+
+### 9b. Disable nvidia-powerd (Dynamic Boost)
+
+`nvidia-powerd` is the Dynamic Boost daemon: while the GPU is active it
+rebalances the shared CPU/GPU power budget. It depends on the SBIOS exposing the
+GPU power rail via the **NVPCF** ACPI interface. This laptop's SBIOS does not,
+and actively requests Dynamic Boost be disabled — powerd logs:
+
+```
+ERROR! Client (presumably SBIOS) has requested to disable Dynamic Boost DC controller
+```
+
+With powerd running, it polls this dead interface and floods the journal every
+~22s with `PRH failed to update thermal limit`. Dynamic Boost is useless for
+sustained compute (the GPU wants its full budget) and unavailable here
+regardless.
+
+Masking powerd removes the every-22s flood. It does **not** eliminate PRH
+messages entirely: the driver itself probes the SBIOS thermal interface at init
+and on each D3cold wake, so a few PRH lines per boot remain (clustered at
+boot/wake, not the periodic flood). These are benign — there is **no driver
+flag** to disable the PlatformRequestHandler (`modinfo nvidia` exposes none),
+and the real fix would be an LG BIOS that exposes NVPCF (none exists for the
+16Z90TR as of this writing). D3cold/battery and suspend use separate subsystems
+and are unaffected.
+
+Use `mask` (not `disable`): the driver package's systemd preset re-enables
+powerd on every upgrade; `mask` survives presets.
+
+```bash
+sudo systemctl mask --now nvidia-powerd
 ```
 
 ### 10. Enable nvidia suspend/hibernate/resume Services
