@@ -54,15 +54,24 @@ sudo dpkg-divert --add --rename \
     /usr/share/glvnd/egl_vendor.d/10_nvidia.json
 ```
 
-### 2. Force Mesa EGL System-Wide
+### 2. Force Mesa GLX/PRIME System-Wide
 
-Even with the priority fix, some apps probe NVIDIA. This environment variable
-forces Mesa for all desktop rendering:
+The step 1 `dpkg-divert` already makes `50_mesa.json` the highest-priority EGL
+vendor, so **EGL** needs no environment variable. For **GLX** and PRIME offload
+(which the divert does not cover), set:
 
 ```bash
 # /etc/environment
-__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+__NV_PRIME_RENDER_OFFLOAD=0
+__GLX_VENDOR_LIBRARY_NAME=mesa
 ```
+
+**Do not** set `__EGL_VENDOR_LIBRARY_FILENAMES` in `/etc/environment`. It pins an
+absolute host path that leaks into confined snaps (their DBus-activated services
+inherit `/etc/environment`), where the host path is invalid inside the snap
+mount namespace — `eglGetPlatformDisplayEXT` then finds no provider and the app
+`SIGABRT`s. Observed breaking the `firmware-updater` snap. The step 1 divert
+makes this pin redundant for the host anyway.
 
 ### 3. Disable NVIDIA DRM Modesetting
 

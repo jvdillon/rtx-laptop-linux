@@ -92,19 +92,27 @@ else
     echo "[1/14] NVIDIA EGL already diverted (skipped)"
 fi
 
-# 2. Force Mesa EGL system-wide
-if ! grep -q "__EGL_VENDOR_LIBRARY_FILENAMES" /etc/environment 2>/dev/null; then
+# 2. Force Mesa GLX/PRIME system-wide (EGL is already handled by step 1's divert)
+#
+# Do NOT set __EGL_VENDOR_LIBRARY_FILENAMES here. It pins an absolute HOST path
+# that leaks into confined snaps via /etc/environment (snap DBus-activated
+# services inherit it), where that host path is invalid inside the snap mount
+# namespace -> eglGetPlatformDisplayEXT finds no provider -> SIGABRT. Step 1's
+# dpkg-divert (10_nvidia.json -> 90_nvidia.json) already makes 50_mesa.json the
+# highest-priority EGL vendor system-wide, so the pin is redundant for the host
+# and purely harmful to snaps. GLX + PRIME below are unaffected by confinement.
+if ! grep -q "__GLX_VENDOR_LIBRARY_NAME" /etc/environment 2>/dev/null; then
     cat >> /etc/environment << 'EOF'
 
-# Force Mesa/Intel for EGL/GLX, prevent nvidia from being used by gnome-shell
-# and Chrome (including PWAs launched outside the patched system .desktop).
-__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+# Force Mesa for GLX, prevent nvidia from being used by gnome-shell and Chrome
+# (including PWAs launched outside the patched system .desktop). EGL is forced
+# to Mesa by the dpkg-divert in step 1, not here -- see note above.
 __NV_PRIME_RENDER_OFFLOAD=0
 __GLX_VENDOR_LIBRARY_NAME=mesa
 EOF
-    echo "[2/14] Added Mesa EGL environment variable"
+    echo "[2/14] Added Mesa GLX/PRIME environment variables"
 else
-    echo "[2/14] Mesa EGL environment variable already set (skipped)"
+    echo "[2/14] Mesa GLX/PRIME environment variables already set (skipped)"
 fi
 
 # 3. Disable NVIDIA DRM modesetting (headless/compute-only dGPU)
@@ -164,22 +172,26 @@ EOF
 echo "[5/14] Created udev rule for runtime PM"
 
 # 6. Wake GPU before shutdown/sleep
-cat > /etc/systemd/system/nvidia-wake.service << EOF
-[Unit]
-Description=Wake NVIDIA GPU before shutdown/sleep to prevent hangs
-DefaultDependencies=no
-Before=shutdown.target reboot.target halt.target suspend.target hibernate.target hybrid-sleep.target nvidia-suspend.service nvidia-hibernate.service
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash -c 'echo on > /sys/bus/pci/devices/${GPU_PCI}/power/control; sleep 1'
-
-[Install]
-WantedBy=halt.target reboot.target shutdown.target suspend.target hibernate.target hybrid-sleep.target
-EOF
-systemctl daemon-reload
-systemctl enable nvidia-wake.service
-echo "[6/14] Created and enabled nvidia-wake service"
+# This path is the most likely wedge trigger on this laptop because it re-pokes
+# the same firmware path used for thermal/power negotiation. Keep the GPU able to
+# enter D3cold via runtime PM, but avoid forcing it back to "on" before every
+# sleep/shutdown until the firmware issue is better understood.
+# cat > /etc/systemd/system/nvidia-wake.service << EOF
+# [Unit]
+# Description=Wake NVIDIA GPU before shutdown/sleep to prevent hangs
+# DefaultDependencies=no
+# Before=shutdown.target reboot.target halt.target suspend.target hibernate.target hybrid-sleep.target nvidia-suspend.service nvidia-hibernate.service
+#
+# [Service]
+# Type=oneshot
+# ExecStart=/bin/bash -c 'echo on > /sys/bus/pci/devices/${GPU_PCI}/power/control; sleep 1'
+#
+# [Install]
+# WantedBy=halt.target reboot.target shutdown.target suspend.target hibernate.target hybrid-sleep.target
+# EOF
+# systemctl daemon-reload
+# systemctl enable nvidia-wake.service
+# echo "[6/14] Created and enabled nvidia-wake service"
 
 # 7. Fix hibernate resume (exclude nvidia from initramfs) + early i915 KMS
 if [[ -d /etc/dracut.conf.d ]]; then
@@ -216,29 +228,34 @@ else
 fi
 
 # 8a. Restore runtime PM after boot
-cat > /etc/systemd/system/nvidia-power-control.service << EOF
-[Unit]
-Description=Enable NVIDIA GPU runtime power management
-After=multi-user.target tlp.service
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash -c 'echo auto > /sys/bus/pci/devices/${GPU_PCI}/power/control'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable nvidia-power-control.service
-echo "[8a/14] Created and enabled nvidia-power-control service"
+# The udev rule already sets power/control=auto for NVIDIA 3D controllers.
+# Leaving out extra boot-time writes reduces how often we exercise the same
+# flaky SBIOS thermal/power path while still allowing D3cold idle savings.
+# cat > /etc/systemd/system/nvidia-power-control.service << EOF
+# [Unit]
+# Description=Enable NVIDIA GPU runtime power management
+# After=multi-user.target tlp.service
+#
+# [Service]
+# Type=oneshot
+# ExecStart=/bin/bash -c 'echo auto > /sys/bus/pci/devices/${GPU_PCI}/power/control'
+#
+# [Install]
+# WantedBy=multi-user.target
+# EOF
+# systemctl daemon-reload
+# systemctl enable nvidia-power-control.service
+# echo "[8a/14] Created and enabled nvidia-power-control service"
 
 # 8b. Restore runtime PM after resume
-mkdir -p /etc/systemd/system/nvidia-resume.service.d
-cat > /etc/systemd/system/nvidia-resume.service.d/restore-pm.conf << EOF
-[Service]
-ExecStartPost=/bin/bash -c 'echo auto > /sys/bus/pci/devices/${GPU_PCI}/power/control'
-EOF
-echo "[8b/14] Added runtime PM restore to nvidia-resume service"
+# Keeping this write commented avoids another post-resume poke at the same
+# firmware path; the udev rule already supplies the desired default on add/bind.
+# mkdir -p /etc/systemd/system/nvidia-resume.service.d
+# cat > /etc/systemd/system/nvidia-resume.service.d/restore-pm.conf << EOF
+# [Service]
+# ExecStartPost=/bin/bash -c 'echo auto > /sys/bus/pci/devices/${GPU_PCI}/power/control'
+# EOF
+# echo "[8b/14] Added runtime PM restore to nvidia-resume service"
 
 # 9. Disable nvidia-persistenced
 if systemctl is-enabled nvidia-persistenced &>/dev/null; then
