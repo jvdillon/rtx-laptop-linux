@@ -115,38 +115,26 @@ else
     echo "[2/14] Mesa GLX/PRIME environment variables already set (skipped)"
 fi
 
-# 3. Disable NVIDIA DRM modesetting (headless/compute-only dGPU)
+# 3. Keep NVIDIA out of the desktop DRM stack (compute-only dGPU)
 #
 # The dGPU drives no display connectors here (all eDP/DP/HDMI are on the Intel
-# iGPU), so KMS exists only to expose /dev/dri/card0+renderD129 for the desktop
-# to probe -- which we don't want. CUDA uses /dev/nvidia* directly and is
-# unaffected by modeset.
-#
-# IMPORTANT: ubuntu-drivers ships /usr/lib/modprobe.d/nvidia-kms.conf with
-# `modeset=1`. modprobe merges all *.conf across /etc and /usr/lib, sorts by
-# FILENAME, and for a repeated option LAST-wins. A differently-named file in
-# /etc does NOT override it: e.g. nvidia-graphics-drivers-kms.conf ("g") sorts
-# BEFORE nvidia-kms.conf ("k"), so the /usr/lib modeset=1 wins regardless.
-# The only deterministic override is a SAME-BASENAME file in /etc, which fully
-# shadows the /usr/lib copy. So we write /etc/modprobe.d/nvidia-kms.conf.
+# iGPU). `options nvidia-drm modeset=0` is not enough: nvidia_drm can still load,
+# create /dev/dri/card0, and be opened by GNOME. That repeated desktop probing has
+# been observed immediately before Xid 62 / GSP PMU halt on this laptop. CUDA uses
+# /dev/nvidia* and nvidia_uvm, so it does not need nvidia_drm.
 KMS_SHADOW=/etc/modprobe.d/nvidia-kms.conf
-if [[ ! -f "$KMS_SHADOW" ]] || ! grep -q '^options nvidia-drm modeset=0' "$KMS_SHADOW"; then
-    cat > "$KMS_SHADOW" << 'EOF'
-# Shadows /usr/lib/modprobe.d/nvidia-kms.conf (ubuntu-drivers, modeset=1).
-# Same basename -> /etc copy fully replaces the /usr/lib one. Headless dGPU:
-# no display connectors on nvidia, so KMS is unwanted. CUDA is unaffected.
-options nvidia-drm modeset=0
+cat > "$KMS_SHADOW" << 'EOF'
+# Keep the compute dGPU out of the desktop DRM stack.
+# modeset=0 alone still exposes /dev/dri/card*; blacklist nvidia_drm instead.
+blacklist nvidia_drm
+install nvidia_drm /bin/false
 EOF
-    echo "[3/14] Disabled NVIDIA DRM modesetting (shadow $KMS_SHADOW)"
-else
-    echo "[3/14] NVIDIA DRM modesetting already disabled (skipped)"
-fi
-# Neutralize the legacy differently-named file so it can't add a stray
-# conflicting directive (its modeset value no longer matters, but keep clean).
+echo "[3/14] Blacklisted nvidia_drm so the desktop cannot open NVIDIA DRM nodes"
+
 LEGACY_KMS=/etc/modprobe.d/nvidia-graphics-drivers-kms.conf
-if [[ -f "$LEGACY_KMS" ]] && grep -q 'modeset=1' "$LEGACY_KMS"; then
-    sed -i 's/modeset=1/modeset=0/' "$LEGACY_KMS"
-    echo "       (also set modeset=0 in legacy $LEGACY_KMS)"
+if [[ -f "$LEGACY_KMS" ]]; then
+    sed -i 's/^options nvidia-drm/# options nvidia-drm/' "$LEGACY_KMS"
+    echo "       (neutralized legacy $LEGACY_KMS)"
 fi
 
 # 4. Fix nv_open_q CPU spin bug
@@ -171,27 +159,13 @@ ACTION=="add|change|bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}
 EOF
 echo "[5/14] Created udev rule for runtime PM"
 
-# 6. Wake GPU before shutdown/sleep
-# This path is the most likely wedge trigger on this laptop because it re-pokes
-# the same firmware path used for thermal/power negotiation. Keep the GPU able to
-# enter D3cold via runtime PM, but avoid forcing it back to "on" before every
-# sleep/shutdown until the firmware issue is better understood.
-# cat > /etc/systemd/system/nvidia-wake.service << EOF
-# [Unit]
-# Description=Wake NVIDIA GPU before shutdown/sleep to prevent hangs
-# DefaultDependencies=no
-# Before=shutdown.target reboot.target halt.target suspend.target hibernate.target hybrid-sleep.target nvidia-suspend.service nvidia-hibernate.service
-#
-# [Service]
-# Type=oneshot
-# ExecStart=/bin/bash -c 'echo on > /sys/bus/pci/devices/${GPU_PCI}/power/control; sleep 1'
-#
-# [Install]
-# WantedBy=halt.target reboot.target shutdown.target suspend.target hibernate.target hybrid-sleep.target
-# EOF
-# systemctl daemon-reload
-# systemctl enable nvidia-wake.service
-# echo "[6/14] Created and enabled nvidia-wake service"
+# 6. Remove wake-before-sleep workaround
+# This service re-pokes the firmware power path before every sleep/shutdown. On
+# this laptop, suspend/resume logs show NVIDIA ACPI D-notifier failures, so keep
+# D3cold via runtime PM but avoid this extra transition.
+systemctl disable --now nvidia-wake.service 2>/dev/null || true
+rm -f /etc/systemd/system/nvidia-wake.service
+echo "[6/14] Removed nvidia-wake service"
 
 # 7. Fix hibernate resume (exclude nvidia from initramfs) + early i915 KMS
 if [[ -d /etc/dracut.conf.d ]]; then
@@ -227,35 +201,14 @@ else
     echo "[7/14] No initramfs config found (skipped)"
 fi
 
-# 8a. Restore runtime PM after boot
-# The udev rule already sets power/control=auto for NVIDIA 3D controllers.
-# Leaving out extra boot-time writes reduces how often we exercise the same
-# flaky SBIOS thermal/power path while still allowing D3cold idle savings.
-# cat > /etc/systemd/system/nvidia-power-control.service << EOF
-# [Unit]
-# Description=Enable NVIDIA GPU runtime power management
-# After=multi-user.target tlp.service
-#
-# [Service]
-# Type=oneshot
-# ExecStart=/bin/bash -c 'echo auto > /sys/bus/pci/devices/${GPU_PCI}/power/control'
-#
-# [Install]
-# WantedBy=multi-user.target
-# EOF
-# systemctl daemon-reload
-# systemctl enable nvidia-power-control.service
-# echo "[8a/14] Created and enabled nvidia-power-control service"
-
-# 8b. Restore runtime PM after resume
-# Keeping this write commented avoids another post-resume poke at the same
-# firmware path; the udev rule already supplies the desired default on add/bind.
-# mkdir -p /etc/systemd/system/nvidia-resume.service.d
-# cat > /etc/systemd/system/nvidia-resume.service.d/restore-pm.conf << EOF
-# [Service]
-# ExecStartPost=/bin/bash -c 'echo auto > /sys/bus/pci/devices/${GPU_PCI}/power/control'
-# EOF
-# echo "[8b/14] Added runtime PM restore to nvidia-resume service"
+# 8. Remove extra runtime-PM systemd pokes
+# The udev rule already sets power/control=auto for NVIDIA 3D controllers. Extra
+# boot/resume writes add more transitions through the flaky SBIOS power path.
+systemctl disable --now nvidia-power-control.service 2>/dev/null || true
+rm -f /etc/systemd/system/nvidia-power-control.service
+rm -f /etc/systemd/system/nvidia-resume.service.d/restore-pm.conf
+rmdir /etc/systemd/system/nvidia-resume.service.d 2>/dev/null || true
+echo "[8/14] Removed extra runtime-PM boot/resume services"
 
 # 9. Disable nvidia-persistenced
 if systemctl is-enabled nvidia-persistenced &>/dev/null; then
@@ -295,9 +248,11 @@ else
     echo "[9b/14] nvidia-powerd already masked (skipped)"
 fi
 
-# 10. Enable nvidia suspend/hibernate/resume services
-systemctl enable nvidia-suspend nvidia-hibernate nvidia-resume 2>/dev/null || true
-echo "[10/14] Enabled nvidia suspend/hibernate/resume services"
+# 10. Disable nvidia suspend/hibernate/resume services
+# The 07:59 suspend/resume log showed NVIDIA ACPI D-notifier failures, and the
+# later wedge followed repeated dGPU wakeups through the same power path.
+systemctl disable --now nvidia-suspend nvidia-hibernate nvidia-resume 2>/dev/null || true
+echo "[10/14] Disabled nvidia suspend/hibernate/resume services"
 
 # 11. Disable nvidia-settings autostart (for the real user)
 AUTOSTART_DIR="$REAL_HOME/.config/autostart"
@@ -352,8 +307,9 @@ echo "Setup complete! Reboot to apply changes."
 echo ""
 echo "After reboot, verify:"
 echo "  cat /sys/bus/pci/devices/${GPU_PCI}/power/runtime_status  # 'suspended' when idle"
-echo "  sudo cat /sys/module/nvidia_drm/parameters/modeset        # N (modesetting off)"
+echo "  lsmod | grep '^nvidia_drm'                                # no output"
+echo "  test ! -e /dev/dri/card0 || readlink /sys/class/drm/card0/device/driver"
 echo "  dpkg-divert --list '*10_nvidia*'                          # divert listed"
 echo "  systemctl is-enabled nvidia-powerd                       # masked"
-echo "  journalctl -k -b | grep -c UNLOADING_GUEST_DRIVE          # 0 = no GPU fall-off"
+echo "  systemctl is-enabled nvidia-suspend nvidia-resume         # disabled"
 echo "=========================================="
