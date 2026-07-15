@@ -1,315 +1,466 @@
-#!/bin/bash
-# RTX Laptop Linux Power Management Setup
-# Installs NVIDIA drivers and enables D3cold power states for hybrid graphics.
+#!/usr/bin/env bash
+# Configure this Ubuntu laptop as an Intel-display, NVIDIA-compute system.
+#
+# This file has two jobs:
+#   1. Bootstrap the NVIDIA open driver on a fresh Ubuntu install.
+#   2. Record the power policy, the workarounds behind it, and their exit paths.
+#
+# Hardware policy:
+#   - Intel drives the desktop and every physical display connector.
+#   - NVIDIA is intended for explicit compute; fine runtime PM (0x02) and D3cold
+#     are the desired steady state because they materially reduce idle power.
+#   - NVIDIA's EGL and Vulkan manifests are disabled so desktop applications
+#     cannot auto-select the dGPU through those graphics APIs. CUDA remains
+#     available normally through libcuda and /dev/nvidia*.
+#
+# Temporary driver/firmware workarounds:
+#   - Keep packaged fine runtime PM (0x02). A trial of coarse mode (0x01) caused
+#     a boot-time RmInitAdapter lock deadlock and was reverted. Disabling runtime
+#     PM (0x00) was considered but not boot-tested because it sacrifices D3cold.
+#   - Nonblocking open is disabled until NVIDIA fixes the nv_open_q CPU spin.
+#   - NVIDIA modules stay out of initramfs until hibernate restore is reliable.
+#   - NVIDIA's system-sleep services stay disabled because this SBIOS produces
+#     ACPI D-notifier failures on suspend/resume.
+#   - nvidia-powerd stays masked because this SBIOS does not expose NVPCF.
+#
+# Fine runtime PM (0x02) remains the preferred policy because it preserves
+# D3cold. When the remaining bugs are fixed, remove the other temporary overrides
+# and initramfs exclusion, retest the official sleep services, and unmask powerd
+# only if the BIOS exposes NVPCF.
+#
 # Run with: sudo ./setup.sh
 
-set -e
+set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-    echo "This script must be run as root (sudo ./setup.sh)"
+    echo "This script must run as root: sudo ./setup.sh" >&2
+    exit 1
+fi
+if [[ -z ${SUDO_USER:-} || $SUDO_USER == root ]]; then
+    echo "Run this script from the desktop account with sudo ./setup.sh." >&2
     exit 1
 fi
 
-# Get the user who invoked sudo (for user-specific config)
-REAL_USER="${SUDO_USER:-$USER}"
-REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+. /etc/os-release
+if [[ ${ID:-} != ubuntu ]]; then
+    echo "This setup supports Ubuntu only (found ${ID:-unknown})." >&2
+    exit 1
+fi
 
-# ------------------------------------------------------------------------------
-# Driver Installation (Ubuntu)
-# ------------------------------------------------------------------------------
+REAL_USER=$SUDO_USER
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6 || true)
+if [[ -z $REAL_HOME ]]; then
+    echo "Cannot resolve the home directory for $REAL_USER." >&2
+    exit 1
+fi
 
-install_drivers() {
-    echo "Installing NVIDIA drivers..."
-
-    # Purge existing nvidia packages
-    apt purge -y '^nvidia-.*' '^libnvidia-.*' 2>/dev/null || true
-    apt autoremove -y
-
-    # Add NVIDIA CUDA repository for latest drivers
-    wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb
-    dpkg -i /tmp/cuda-keyring.deb
-    apt modernize-sources || true
-    apt update
-
-    # Install open driver (nvidia-open is the open-source kernel modules)
-    apt install -y nvidia-open
-
-    echo "Driver installation complete."
+status() {
+    printf '[%s] %s\n' "$1" "$2"
 }
 
-# Check if drivers need installation
-if ! command -v nvidia-smi &>/dev/null; then
-    install_drivers
-else
-    DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
-    echo "NVIDIA driver $DRIVER_VERSION already installed."
-    read -p "Reinstall drivers? [y/N] " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        install_drivers
+disable_unit_if_present() {
+    local load_state
+    load_state=$(systemctl show --property=LoadState --value "$1")
+    case "$load_state" in
+        loaded) systemctl disable --now "$1" ;;
+        masked) systemctl stop "$1" ;;
+        not-found) ;;
+        *)
+            echo "Cannot determine the state of $1 (LoadState=$load_state)." >&2
+            exit 1
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# Driver bootstrap
+# ------------------------------------------------------------------------------
+# A fresh install needs NVIDIA's CUDA repository because Blackwell requires the
+# open kernel modules. This script deliberately does not purge broad nvidia-*
+# package patterns. A fresh machine has nothing to purge, and a failed reinstall
+# after a purge can leave the machine without a usable driver.
+install_driver() {
+    local repo="ubuntu${VERSION_ID//./}"
+    local keyring
+    case "$repo" in
+        ubuntu2404|ubuntu2604) ;;
+        *)
+            echo "No CUDA repository configured for Ubuntu ${VERSION_ID}." >&2
+            exit 1
+            ;;
+    esac
+
+    status driver "Adding NVIDIA CUDA repository for $repo"
+    apt-get update
+    apt-get install -y ca-certificates wget
+    keyring=$(mktemp /tmp/cuda-keyring.XXXXXX.deb)
+    trap "rm -f -- '$keyring'" EXIT
+    wget -q "https://developer.download.nvidia.com/compute/cuda/repos/$repo/x86_64/cuda-keyring_1.1-1_all.deb" \
+        -O "$keyring"
+    dpkg -i "$keyring"
+    rm -f "$keyring"
+    trap - EXIT
+    apt-get update
+    apt-get install -y nvidia-open
+}
+
+DRIVER_VERSION=$(modinfo -F version nvidia 2>/dev/null || true)
+DRIVER_LICENSE=$(modinfo -F license nvidia 2>/dev/null || true)
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    if [[ -n $DRIVER_VERSION && $DRIVER_LICENSE != "Dual MIT/GPL" ]]; then
+        echo "An unknown NVIDIA kernel module is already installed." >&2
+        echo "Refusing to replace it automatically." >&2
+        exit 1
     fi
+    install_driver
 fi
 
-# ------------------------------------------------------------------------------
-# Power Management Setup
-# ------------------------------------------------------------------------------
+DRIVER_VERSION=
+for module in nvidia nvidia_uvm; do
+    MODULE_VERSION=$(modinfo -F version "$module" 2>/dev/null || true)
+    MODULE_LICENSE=$(modinfo -F license "$module" 2>/dev/null || true)
+    if [[ -z $MODULE_VERSION || $MODULE_LICENSE != "Dual MIT/GPL" ]]; then
+        echo "Open NVIDIA module $module is not installed for this kernel." >&2
+        exit 1
+    fi
+    if [[ $module == nvidia ]]; then
+        DRIVER_VERSION=$MODULE_VERSION
+    elif [[ $MODULE_VERSION != "$DRIVER_VERSION" ]]; then
+        echo "NVIDIA module versions do not match." >&2
+        exit 1
+    fi
+done
+status driver "NVIDIA open driver $DRIVER_VERSION installed"
 
-# Detect NVIDIA GPU PCI address.
-# lspci prints "<addr> 3D controller: NVIDIA ..." -- the class precedes the
-# vendor, so a 'nvidia.*3d' pattern never matches. Match either order.
-GPU_PCI=$(lspci -D | grep -iE '(3d|vga)[^:]*controller.*nvidia|nvidia.*(3d|vga)' | head -1 | awk '{print $1}')
-if [[ -z "$GPU_PCI" ]]; then
-    echo "Error: No NVIDIA GPU found"
+# Select the same PCI class used by the runtime-PM rule below. Reading sysfs
+# avoids depending on pciutils and keeps discovery aligned with the policy.
+GPU_PCI=
+for device in /sys/bus/pci/devices/*; do
+    [[ -r $device/vendor && -r $device/class ]] || continue
+    if [[ $(<"$device/vendor") == 0x10de && $(<"$device/class") == 0x030200 ]]; then
+        GPU_PCI=${device##*/}
+        break
+    fi
+done
+if [[ -z $GPU_PCI ]]; then
+    echo "No NVIDIA 3D controller found." >&2
     exit 1
 fi
-echo "Found NVIDIA GPU at: $GPU_PCI"
-echo ""
+status hardware "NVIDIA GPU at $GPU_PCI"
 
-# 1. Demote NVIDIA EGL priority
-# libglvnd loads EGL vendor JSONs in filename order; 10_nvidia.json wins over
-# 50_mesa.json, so the desktop renders on (and wakes) the dGPU. A plain
-# `mv 10->90` is NOT durable: libnvidia-gl upgrades RE-CREATE 10_nvidia.json,
-# silently undoing the demotion (and a second mv then fails because 90_ exists).
-# Use dpkg-divert so the package's own 10_nvidia.json is permanently redirected
-# and never reappears at the winning filename across upgrades.
-EGL_DIR=/usr/share/glvnd/egl_vendor.d
-if ! dpkg-divert --list "$EGL_DIR/10_nvidia.json" | grep -q .; then
-    # The divert renames 10_nvidia.json -> 90_nvidia.json. A prior manual
-    # `mv 10->90` (plus a driver upgrade re-creating 10_) can leave BOTH files
-    # present; dpkg-divert then refuses ("rename involves overwriting 90_").
-    # 90_ is a byte-identical copy of the package's 10_, so remove the stale 90_
-    # to free the rename target before diverting.
-    if [[ -f "$EGL_DIR/10_nvidia.json" && -f "$EGL_DIR/90_nvidia.json" ]]; then
-        rm -f "$EGL_DIR/90_nvidia.json"
-    elif [[ ! -f "$EGL_DIR/10_nvidia.json" && -f "$EGL_DIR/90_nvidia.json" ]]; then
-        # Only the renamed copy exists: restore it so divert --rename can act.
-        mv "$EGL_DIR/90_nvidia.json" "$EGL_DIR/10_nvidia.json"
-    fi
-    dpkg-divert --add --rename --divert "$EGL_DIR/90_nvidia.json" \
-        "$EGL_DIR/10_nvidia.json"
-    echo "[1/14] Demoted NVIDIA EGL priority (dpkg-divert 10->90, upgrade-proof)"
-else
-    echo "[1/14] NVIDIA EGL already diverted (skipped)"
-fi
-
-# 2. Force Mesa GLX/PRIME system-wide (EGL is already handled by step 1's divert)
+# ------------------------------------------------------------------------------
+# Desktop policy: Intel renders; block automatic NVIDIA graphics discovery
+# ------------------------------------------------------------------------------
+# Chrome rendered through Intel but still auto-selected NVIDIA through Vulkan;
+# that wake triggered the 2026-07-13 GC6-resume GSP crash. Chrome also loaded the
+# NVIDIA EGL vendor while using Intel. Disable both manifests system-wide. This
+# removes NVIDIA EGL/Vulkan graphics but leaves normal CUDA access unchanged.
 #
-# Do NOT set __EGL_VENDOR_LIBRARY_FILENAMES here. It pins an absolute HOST path
-# that leaks into confined snaps via /etc/environment (snap DBus-activated
-# services inherit it), where that host path is invalid inside the snap mount
-# namespace -> eglGetPlatformDisplayEXT finds no provider -> SIGABRT. Step 1's
-# dpkg-divert (10_nvidia.json -> 90_nvidia.json) already makes 50_mesa.json the
-# highest-priority EGL vendor system-wide, so the pin is redundant for the host
-# and purely harmful to snaps. GLX + PRIME below are unaffected by confinement.
-if ! grep -q "__GLX_VENDOR_LIBRARY_NAME" /etc/environment 2>/dev/null; then
+# dpkg-divert makes the exclusions survive libnvidia-gl upgrades. The disabled
+# filenames do not end in .json, so EGL and Vulkan loaders do not discover them.
+# We previously tried __EGL_VENDOR_LIBRARY_FILENAMES instead. Do not restore it
+# in /etc/environment: its host path is invalid inside confined snap namespaces.
+divert_graphics_manifest() {
+    local source=$1
+    local target=$2
+    local legacy_target=${3:-}
+    local truename
+
+    truename=$(dpkg-divert --truename "$source")
+    if [[ -n $legacy_target && $truename == "$legacy_target" ]]; then
+        if [[ -e $source || -e $target ]]; then
+            echo "Cannot migrate diversion for $source: destination conflict." >&2
+            exit 1
+        fi
+        dpkg-divert --local --remove --rename \
+            --divert "$legacy_target" "$source"
+        truename=$source
+    fi
+
+    if [[ $truename == "$source" ]]; then
+        if [[ -e $target ]]; then
+            echo "Cannot divert $source: $target already exists." >&2
+            exit 1
+        fi
+        dpkg-divert --local --add --rename --divert "$target" "$source"
+    elif [[ $truename != "$target" ]]; then
+        echo "$source is diverted to unexpected target $truename." >&2
+        exit 1
+    fi
+
+    if [[ -e $source ]]; then
+        echo "$source remains discoverable after diversion." >&2
+        exit 1
+    fi
+}
+
+EGL_SOURCE=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+EGL_DISABLED=${EGL_SOURCE}.disabled
+EGL_LEGACY=/usr/share/glvnd/egl_vendor.d/90_nvidia.json
+divert_graphics_manifest "$EGL_SOURCE" "$EGL_DISABLED" "$EGL_LEGACY"
+status desktop "NVIDIA excluded from automatic EGL discovery"
+
+VULKAN_SOURCE=/usr/share/vulkan/icd.d/nvidia_icd.json
+VULKAN_DISABLED=${VULKAN_SOURCE}.disabled
+divert_graphics_manifest "$VULKAN_SOURCE" "$VULKAN_DISABLED"
+status desktop "NVIDIA excluded from automatic Vulkan discovery"
+
+# GLX/PRIME: select Mesa for login paths, including Chrome PWAs. We tried
+# patching Chrome desktop files directly; package upgrades replaced the patches,
+# and alternate PWA launchers bypassed them. These defaults control rendering;
+# they do not stop Chrome from probing NVIDIA through another vendor API.
+if ! grep -q '^# RTX laptop desktop policy$' /etc/environment 2>/dev/null; then
     cat >> /etc/environment << 'EOF'
 
-# Force Mesa for GLX, prevent nvidia from being used by gnome-shell and Chrome
-# (including PWAs launched outside the patched system .desktop). EGL is forced
-# to Mesa by the dpkg-divert in step 1, not here -- see note above.
-__NV_PRIME_RENDER_OFFLOAD=0
-__GLX_VENDOR_LIBRARY_NAME=mesa
+# RTX laptop desktop policy
 EOF
-    echo "[2/14] Added Mesa GLX/PRIME environment variables"
-else
-    echo "[2/14] Mesa GLX/PRIME environment variables already set (skipped)"
 fi
+for setting in '__NV_PRIME_RENDER_OFFLOAD=0' '__GLX_VENDOR_LIBRARY_NAME=mesa'; do
+    key=${setting%%=*}
+    if grep -q "^${key}=" /etc/environment 2>/dev/null; then
+        sed -i "s|^${key}=.*|${setting}|" /etc/environment
+    else
+        echo "$setting" >> /etc/environment
+    fi
+done
+status desktop "Mesa selected for GLX and PRIME"
 
-# 3. Keep NVIDIA out of the desktop DRM stack (compute-only dGPU)
-#
-# The dGPU drives no display connectors here (all eDP/DP/HDMI are on the Intel
-# iGPU). `options nvidia-drm modeset=0` is not enough: nvidia_drm can still load,
-# create /dev/dri/card0, and be opened by GNOME. That repeated desktop probing has
-# been observed immediately before Xid 62 / GSP PMU halt on this laptop. CUDA uses
-# /dev/nvidia* and nvidia_uvm, so it does not need nvidia_drm.
-KMS_SHADOW=/etc/modprobe.d/nvidia-kms.conf
-cat > "$KMS_SHADOW" << 'EOF'
-# Keep the compute dGPU out of the desktop DRM stack.
-# modeset=0 alone still exposes /dev/dri/card*; blacklist nvidia_drm instead.
+# DRM: modeset=0 was insufficient. nvidia_drm still loaded, created
+# /dev/dri/card0, and let GNOME hold the dGPU open. This laptop has no connector
+# wired to NVIDIA, and CUDA does not need nvidia_drm, so block the module.
+cat > /etc/modprobe.d/nvidia-kms.conf << 'EOF'
+# No display connector uses NVIDIA. Block DRM, but leave vendor nodes available.
 blacklist nvidia_drm
 install nvidia_drm /bin/false
 EOF
-echo "[3/14] Blacklisted nvidia_drm so the desktop cannot open NVIDIA DRM nodes"
 
+# Neutralize a file created by older revisions of this script. The same-basename
+# /etc/modprobe.d/nvidia-kms.conf above shadows Ubuntu's packaged file.
 LEGACY_KMS=/etc/modprobe.d/nvidia-graphics-drivers-kms.conf
 if [[ -f "$LEGACY_KMS" ]]; then
     sed -i 's/^options nvidia-drm/# options nvidia-drm/' "$LEGACY_KMS"
-    echo "       (neutralized legacy $LEGACY_KMS)"
 fi
+status desktop "nvidia_drm blocked; nvidia and nvidia_uvm remain unblocked"
 
-# 4. Fix nv_open_q CPU spin bug
-touch /etc/modprobe.d/nvidia-graphics-drivers.conf
-if ! grep -q "NVreg_EnableNonblockingOpen=0" /etc/modprobe.d/nvidia-graphics-drivers.conf; then
-    cat >> /etc/modprobe.d/nvidia-graphics-drivers.conf << 'EOF'
-
-# Fix nv_open_q CPU spin bug
-# https://github.com/NVIDIA/open-gpu-kernel-modules/discussions/615
-options nvidia NVreg_EnableNonblockingOpen=0
-EOF
-    echo "[4/14] Added nv_open_q CPU spin fix"
-else
-    echo "[4/14] nv_open_q fix already present (skipped)"
-fi
-
-# 5. Enable runtime PM via udev
-cat > /etc/udev/rules.d/80-nvidia-pm.rules << 'EOF'
-# Enable runtime power management for NVIDIA GPUs
-# Vendor 0x10de = NVIDIA, Class 0x030200 = 3D controller
-ACTION=="add|change|bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030200", ATTR{power/control}="auto"
-EOF
-echo "[5/14] Created udev rule for runtime PM"
-
-# 6. Remove wake-before-sleep workaround
-# This service re-pokes the firmware power path before every sleep/shutdown. On
-# this laptop, suspend/resume logs show NVIDIA ACPI D-notifier failures, so keep
-# D3cold via runtime PM but avoid this extra transition.
-systemctl disable --now nvidia-wake.service 2>/dev/null || true
-rm -f /etc/systemd/system/nvidia-wake.service
-echo "[6/14] Removed nvidia-wake service"
-
-# 7. Fix hibernate resume (exclude nvidia from initramfs) + early i915 KMS
-if [[ -d /etc/dracut.conf.d ]]; then
-    # Ubuntu 25.04+ uses dracut
-    echo 'omit_drivers+=" nvidia nvidia-drm nvidia-modeset nvidia-uvm "' > /etc/dracut.conf.d/nvidia-exclude.conf
-    echo 'add_drivers+=" i915 "' > /etc/dracut.conf.d/i915.conf
-    echo "[7/14] Excluded nvidia from initramfs, added early i915 (dracut)"
-elif [[ -d /etc/initramfs-tools ]]; then
-    # Ubuntu 24.04 uses initramfs-tools
-    # Exclude nvidia modules from initramfs
-    cat > /etc/initramfs-tools/hooks/exclude-nvidia << 'HOOK'
-#!/bin/sh
-# Exclude nvidia modules from initramfs for hibernate compatibility
-PREREQ=""
-prereqs() { echo "$PREREQ"; }
-case "$1" in prereqs) prereqs; exit 0;; esac
-
-# Remove nvidia modules if they were added (check multiple possible paths)
-# Guard against empty DESTDIR to avoid deleting from live system
-[ -n "${DESTDIR}" ] && {
-    rm -f "${DESTDIR}"/lib/modules/*/kernel/drivers/video/nvidia* 2>/dev/null || true
-    rm -f "${DESTDIR}"/lib/modules/*/updates/dkms/nvidia* 2>/dev/null || true
-    rm -f "${DESTDIR}"/lib/modules/*/kernel/drivers/gpu/nvidia* 2>/dev/null || true
-}
-HOOK
-    chmod +x /etc/initramfs-tools/hooks/exclude-nvidia
-    # Add i915 for early KMS
-    if ! grep -q "^i915$" /etc/initramfs-tools/modules 2>/dev/null; then
-        echo "i915" >> /etc/initramfs-tools/modules
-    fi
-    echo "[7/14] Excluded nvidia from initramfs, added early i915 (initramfs-tools)"
-else
-    echo "[7/14] No initramfs config found (skipped)"
-fi
-
-# 8. Remove extra runtime-PM systemd pokes
-# The udev rule already sets power/control=auto for NVIDIA 3D controllers. Extra
-# boot/resume writes add more transitions through the flaky SBIOS power path.
-systemctl disable --now nvidia-power-control.service 2>/dev/null || true
-rm -f /etc/systemd/system/nvidia-power-control.service
-rm -f /etc/systemd/system/nvidia-resume.service.d/restore-pm.conf
-rmdir /etc/systemd/system/nvidia-resume.service.d 2>/dev/null || true
-echo "[8/14] Removed extra runtime-PM boot/resume services"
-
-# 9. Disable nvidia-persistenced
-if systemctl is-enabled nvidia-persistenced &>/dev/null; then
-    systemctl disable nvidia-persistenced
-    echo "[9/14] Disabled nvidia-persistenced"
-else
-    echo "[9/14] nvidia-persistenced already disabled (skipped)"
-fi
-
-# 9b. Disable nvidia-powerd (Dynamic Boost daemon)
-# This laptop's SBIOS does not expose the NVPCF ACPI interface and actively
-# requests Dynamic Boost be disabled (powerd logs: "Client (presumably SBIOS)
-# has requested to disable Dynamic Boost DC controller"). With powerd running,
-# it polls this dead interface and floods the journal every ~22s with:
-#   NVRM: GPU0 ... PRH failed to update thermal limit! @ platform_request_handler.c
-# Dynamic Boost only rebalances CPU<->GPU watts while the GPU is active; it is
-# useless for sustained compute and unavailable here regardless. Masking it
-# removes the every-22s flood and releases the device handle.
-#
-# NOTE: masking powerd does NOT eliminate PRH messages entirely. The driver
-# itself still probes the SBIOS thermal interface at init and on each D3cold
-# wake, so a few PRH lines per boot remain (clustered at boot/wake, not the
-# periodic flood). These are benign and unavoidable: there is no driver flag to
-# disable the PlatformRequestHandler (modinfo nvidia exposes none), and the true
-# fix is an LG BIOS that exposes NVPCF. D3cold/battery and suspend use separate
-# subsystems and are unaffected.
-#
-# Use `mask`, not `disable`: the nvidia driver package ships a systemd preset
-# (70-nvidia-driver.preset) that re-enables nvidia-powerd on every driver
-# upgrade. `disable` only removes the symlink and is silently undone by the next
-# `systemctl preset`. `mask` points the unit at /dev/null and survives presets
-# and upgrades -- the durable form.
-if [[ "$(systemctl is-enabled nvidia-powerd 2>/dev/null)" != "masked" ]]; then
-    systemctl mask --now nvidia-powerd
-    echo "[9b/14] Masked nvidia-powerd (SBIOS refuses Dynamic Boost; upgrade-proof)"
-else
-    echo "[9b/14] nvidia-powerd already masked (skipped)"
-fi
-
-# 10. Disable nvidia suspend/hibernate/resume services
-# The 07:59 suspend/resume log showed NVIDIA ACPI D-notifier failures, and the
-# later wedge followed repeated dGPU wakeups through the same power path.
-systemctl disable --now nvidia-suspend nvidia-hibernate nvidia-resume 2>/dev/null || true
-echo "[10/14] Disabled nvidia suspend/hibernate/resume services"
-
-# 11. Disable nvidia-settings autostart (for the real user)
+# nvidia-settings opens /dev/nvidia* at login and prevents D3cold. Normal desktop
+# rendering does not require it, so disable its autostart for the invoking user.
 AUTOSTART_DIR="$REAL_HOME/.config/autostart"
-mkdir -p "$AUTOSTART_DIR"
-cat > "$AUTOSTART_DIR/nvidia-settings-autostart.desktop" << 'EOF'
+AUTOSTART_FILE="$AUTOSTART_DIR/nvidia-settings-autostart.desktop"
+runuser -u "$REAL_USER" -- mkdir -p "$AUTOSTART_DIR"
+runuser -u "$REAL_USER" -- tee "$AUTOSTART_FILE" >/dev/null << 'EOF'
 [Desktop Entry]
 Type=Application
 Hidden=true
 EOF
-chown -R "$REAL_USER:$REAL_USER" "$AUTOSTART_DIR"
-echo "[11/14] Disabled nvidia-settings autostart"
+status desktop "nvidia-settings autostart disabled for $REAL_USER"
 
-# 12. Prevent Chrome from waking GPU
-# Superseded by step 2: __NV_PRIME_RENDER_OFFLOAD and __GLX_VENDOR_LIBRARY_NAME
-# are now set in /etc/environment, which covers PWA launchers and any other
-# Chrome entry point. The per-.desktop patch below also gets wiped by every
-# google-chrome-stable apt upgrade, so it's not worth maintaining.
-# CHROME_DESKTOP="/usr/share/applications/google-chrome.desktop"
-# if [[ -f "$CHROME_DESKTOP" ]]; then
-#     if ! grep -q "__NV_PRIME_RENDER_OFFLOAD=0" "$CHROME_DESKTOP"; then
-#         sed -i 's|^Exec=/usr/bin/google-chrome-stable|Exec=env __NV_PRIME_RENDER_OFFLOAD=0 __GLX_VENDOR_LIBRARY_NAME=mesa /usr/bin/google-chrome-stable|' "$CHROME_DESKTOP"
-#         echo "[12/14] Patched Chrome to use Mesa"
-#     else
-#         echo "[12/14] Chrome already patched (skipped)"
-#     fi
-# else
-#     echo "[12/14] Chrome not installed (skipped)"
-# fi
-echo "[12/14] Chrome bypass handled via /etc/environment (step 2)"
+# ------------------------------------------------------------------------------
+# Runtime power policy
+# ------------------------------------------------------------------------------
+# Nonblocking open has caused nv_open_q to spin at high CPU on this driver. This
+# option is temporary; remove it after NVIDIA fixes the open-path bug.
+# https://github.com/NVIDIA/open-gpu-kernel-modules/discussions/615
+cat > /etc/modprobe.d/nvidia-local.conf << 'EOF'
+# Temporary nv_open_q spin workaround.
+options nvidia NVreg_EnableNonblockingOpen=0
+EOF
+# Remove the location used by older revisions of this script.
+LEGACY_OPTIONS=/etc/modprobe.d/nvidia-graphics-drivers.conf
+if [[ -f $LEGACY_OPTIONS ]]; then
+    sed -i '/^options nvidia .*NVreg_EnableNonblockingOpen=0/d' "$LEGACY_OPTIONS"
+fi
+status power "nonblocking NVIDIA open disabled"
 
-# 13. Configure TLP (if installed)
+# NVIDIA packages select fine-grained runtime PM (0x02) in
+# /usr/lib/modprobe.d/nvidia-runtimepm.conf. Fine mode is the desired policy: an
+# idle GPU can enter D3cold even while a long-lived CUDA client remains open.
+#
+# Observed with 0x02: driver 610.43.02 eventually produced Xid 120/154/79 when
+# its GSP failed a GC6->D0 resume. UNLOADING_GUEST_DRIVER appeared in the crash
+# RPC history immediately before the GSP panic.
+#
+# Rejected trial: coarse mode (0x01) loaded on 2026-07-13. On its first boot,
+# the first NVIDIA client deadlocked in RmInitAdapter/kgspInitRm. The leaked RM
+# write lock then blocked GStreamer, Chrome, CUDA clients, and nvidia-smi in
+# uninterruptible sleep. Coarse mode therefore is not a viable mitigation.
+#
+# Restore the pre-experiment fine policy (0x02). A proposed 0x00 diagnostic was
+# not boot-tested: it would discard D3cold without fixing the underlying driver.
+# Shadow the packaged file explicitly so setup.sh records the active now-state.
+cat > /etc/modprobe.d/nvidia-runtimepm.conf << 'EOF'
+# Fine runtime PM preserves D3cold. Do not retry coarse mode (0x01): it wedged.
+options nvidia NVreg_DynamicPowerManagement=0x02
+EOF
+# Remove the location briefly used by an older revision.
+if [[ -f $LEGACY_OPTIONS ]]; then
+    sed -i '/^options nvidia .*NVreg_DynamicPowerManagement=/d' "$LEGACY_OPTIONS"
+fi
+status power "fine runtime PM enabled (0x02) for D3cold"
+
+# Keep PCI runtime PM enabled for D3cold. The rule reapplies power/control=auto
+# whenever the NVIDIA function is added or rebound; TLP must not override it.
+cat > /etc/udev/rules.d/80-nvidia-pm.rules << 'EOF'
+# NVIDIA vendor 10de, class 030200 (3D controller).
+ACTION=="add|change|bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030200", ATTR{power/control}="auto"
+EOF
+status power "PCI runtime PM allowed for the NVIDIA GPU"
+
 if [[ -f /etc/tlp.conf ]]; then
-    if ! grep -q 'RUNTIME_PM_ON_AC="auto"' /etc/tlp.conf; then
-        sed -i '/^#*RUNTIME_PM_ON_AC/d' /etc/tlp.conf
-        echo 'RUNTIME_PM_ON_AC="auto"' >> /etc/tlp.conf
-        echo "[13/14] Configured TLP for runtime PM on AC"
-    else
-        echo "[13/14] TLP already configured (skipped)"
-    fi
+    sed -i -E '/^[[:space:]#]*RUNTIME_PM_ON_AC=/d' /etc/tlp.conf
+    echo 'RUNTIME_PM_ON_AC="auto"' >> /etc/tlp.conf
+    status power "TLP permits runtime PM on AC"
 else
-    echo "[13/14] TLP not installed (skipped)"
+    status power "TLP not installed; no TLP override needed"
 fi
 
-# 14. Rebuild initramfs
-echo ""
-echo "[14/14] Rebuilding initramfs..."
-update-initramfs -u 2>/dev/null || dracut --force 2>/dev/null || true
+# ------------------------------------------------------------------------------
+# Services and sleep hooks
+# ------------------------------------------------------------------------------
+# Older revisions added two custom services:
+#   - nvidia-wake forced power/control=on before sleep and shutdown.
+#   - nvidia-power-control restored auto at boot and after resume.
+# They added transitions through the same failing firmware path. The udev rule
+# already establishes the desired runtime-PM default, so remove both services.
+disable_unit_if_present nvidia-wake.service
+disable_unit_if_present nvidia-power-control.service
+rm -f /etc/systemd/system/nvidia-wake.service
+rm -f /etc/systemd/system/nvidia-power-control.service
+rm -f /etc/systemd/system/nvidia-resume.service.d/restore-pm.conf
+rmdir /etc/systemd/system/nvidia-resume.service.d 2>/dev/null || true
+systemctl daemon-reload
+status services "obsolete custom wake/runtime-PM services removed"
 
-echo ""
-echo "=========================================="
-echo "Setup complete! Reboot to apply changes."
-echo ""
-echo "After reboot, verify:"
-echo "  cat /sys/bus/pci/devices/${GPU_PCI}/power/runtime_status  # 'suspended' when idle"
-echo "  lsmod | grep '^nvidia_drm'                                # no output"
-echo "  test ! -e /dev/dri/card0 || readlink /sys/class/drm/card0/device/driver"
-echo "  dpkg-divert --list '*10_nvidia*'                          # divert listed"
-echo "  systemctl is-enabled nvidia-powerd                       # masked"
-echo "  systemctl is-enabled nvidia-suspend nvidia-resume         # disabled"
-echo "=========================================="
+# Persistence keeps the NVIDIA driver initialized between clients and prevents
+# D3cold. We prefer a cold-start delay on the first CUDA call over constant draw.
+disable_unit_if_present nvidia-persistenced.service
+status services "nvidia-persistenced disabled"
+
+# Dynamic Boost requires the SBIOS NVPCF interface. This LG firmware does not
+# expose it and asks the daemon to disable Dynamic Boost. Leaving powerd active
+# only holds the GPU open and repeats PRH thermal-limit errors. Masking, rather
+# than disabling, survives NVIDIA package presets.
+#
+# Preferred post-fix state: unmask powerd if a BIOS update exposes NVPCF; that
+# would restore dynamic CPU/GPU power-budget sharing while the GPU is active.
+systemctl mask --now nvidia-powerd
+status services "nvidia-powerd masked until SBIOS provides NVPCF"
+
+# NVIDIA's official sleep services touched the same ACPI path that logged
+# D-notifier failures on this laptop. The dGPU drives no display and its modules
+# are excluded from the initramfs below, so disable the services for now.
+#
+# Preferred post-fix state: re-enable these services after NVIDIA/LG fixes the
+# suspend path, then retest s2idle and hibernate before keeping them enabled.
+for unit in nvidia-suspend.service nvidia-hibernate.service nvidia-resume.service; do
+    disable_unit_if_present "$unit"
+done
+status services "NVIDIA suspend/hibernate/resume services disabled"
+
+# ------------------------------------------------------------------------------
+# Initramfs policy
+# ------------------------------------------------------------------------------
+# Loading NVIDIA before hibernate restore made the kernel freeze a newly loaded,
+# incompletely initialized driver and fail with nv_pmops_freeze -5. Exclude the
+# NVIDIA modules so they load after restore. Add i915 early so Intel can display
+# the LUKS prompt.
+#
+# Preferred post-fix state: remove the NVIDIA exclusion once hibernate restore
+# works with the packaged initramfs policy. Early i915 remains useful.
+#
+# Detect the installed implementation by package ownership, not command names.
+# Ubuntu's dracut package provides an update-initramfs compatibility wrapper, so
+# the presence of /usr/sbin/update-initramfs does not imply initramfs-tools.
+if [[ $(dpkg-query -W -f='${db:Status-Abbrev}' dracut-core 2>/dev/null || true) == ii* ]]; then
+    INITRAMFS_BACKEND=dracut
+elif [[ $(dpkg-query -W -f='${db:Status-Abbrev}' initramfs-tools 2>/dev/null || true) == ii* ]]; then
+    INITRAMFS_BACKEND=initramfs-tools
+else
+    echo "Neither dracut-core nor initramfs-tools is installed." >&2
+    exit 1
+fi
+status initramfs "detected $INITRAMFS_BACKEND"
+
+if [[ $INITRAMFS_BACKEND == dracut ]]; then
+    mkdir -p /etc/dracut.conf.d
+    echo 'omit_drivers+=" nvidia nvidia-drm nvidia-modeset nvidia-uvm "' \
+        > /etc/dracut.conf.d/nvidia-exclude.conf
+    echo 'add_drivers+=" i915 "' > /etc/dracut.conf.d/i915.conf
+    status initramfs "configured dracut: exclude NVIDIA, add i915"
+else
+    mkdir -p /etc/initramfs-tools/hooks
+    rm -f /etc/initramfs-tools/hooks/exclude-nvidia
+    cat > /etc/initramfs-tools/hooks/zz-exclude-nvidia << 'HOOK'
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0;; esac
+
+# NVIDIA's package hook queues these for mkinitramfs's final module-copy pass.
+# Remove both queued names and anything an earlier pass already copied.
+if [ -n "${__MODULES_TO_ADD:-}" ] && [ -f "$__MODULES_TO_ADD" ]; then
+    sed -i '\#\(^\|/\)nvidia[^/]*$#d' "$__MODULES_TO_ADD"
+fi
+if [ -n "${DESTDIR:-}" ]; then
+    rm -f "${DESTDIR}"/lib/modules/*/kernel/drivers/video/nvidia* 2>/dev/null || true
+    rm -f "${DESTDIR}"/lib/modules/*/updates/dkms/nvidia* 2>/dev/null || true
+    rm -f "${DESTDIR}"/lib/modules/*/kernel/drivers/gpu/nvidia* 2>/dev/null || true
+fi
+HOOK
+    chmod +x /etc/initramfs-tools/hooks/zz-exclude-nvidia
+    grep -qxF i915 /etc/initramfs-tools/modules 2>/dev/null || \
+        echo i915 >> /etc/initramfs-tools/modules
+    status initramfs "configured initramfs-tools: exclude NVIDIA, add i915"
+fi
+
+status initramfs "rebuilding with $INITRAMFS_BACKEND"
+# On dracut-based Ubuntu, update-initramfs is a dracut-owned compatibility
+# wrapper. Rebuild every existing image so fallback kernels use the same policy.
+update-initramfs -u -k all
+
+# ------------------------------------------------------------------------------
+# Post-reboot checks
+# ------------------------------------------------------------------------------
+cat << EOF
+
+Setup complete. Reboot before evaluating the policy.
+
+After reboot, verify:
+  grep DynamicPowerManagement /proc/driver/nvidia/params
+      expected: DynamicPowerManagement: 2
+
+  lsmod | grep '^nvidia_drm'
+      expected: no output
+
+  cat /sys/bus/pci/devices/${GPU_PCI}/power/control
+      expected: auto
+
+  cat /sys/bus/pci/devices/${GPU_PCI}/power/runtime_status
+      expected when no NVIDIA client is open: suspended
+
+  systemctl is-enabled nvidia-powerd nvidia-persistenced \
+      nvidia-suspend nvidia-hibernate nvidia-resume
+      expected: masked, disabled, disabled, disabled, disabled
+
+Future rollback after driver/firmware fixes:
+  sudo dpkg-divert --local --remove --rename \
+      --divert /usr/share/glvnd/egl_vendor.d/10_nvidia.json.disabled \
+      /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+      restores NVIDIA EGL discovery
+  sudo dpkg-divert --local --remove --rename \
+      --divert /usr/share/vulkan/icd.d/nvidia_icd.json.disabled \
+      /usr/share/vulkan/icd.d/nvidia_icd.json
+      restores NVIDIA Vulkan discovery
+  sudo rm /etc/modprobe.d/nvidia-runtimepm.conf
+      delegates fine-grained runtime PM (0x02) to the packaged configuration
+  sudo rm /etc/modprobe.d/nvidia-local.conf
+      restores the packaged nonblocking-open behavior
+  sudo rm /etc/dracut.conf.d/nvidia-exclude.conf
+      or: sudo rm /etc/initramfs-tools/hooks/zz-exclude-nvidia
+  sudo update-initramfs -u -k all
+      rebuilds every existing image after removing the exclusion
+  sudo systemctl unmask nvidia-powerd
+  sudo systemctl enable --now nvidia-powerd
+      only after SBIOS exposes NVPCF
+  sudo systemctl enable nvidia-suspend nvidia-hibernate nvidia-resume
+      only after suspend and hibernate pass repeated testing
+EOF
