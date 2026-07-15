@@ -10,8 +10,10 @@
 #   - NVIDIA is intended for explicit compute; fine runtime PM (0x02) and D3cold
 #     are the desired steady state because they materially reduce idle power.
 #   - NVIDIA's EGL and Vulkan manifests are disabled so desktop applications
-#     cannot auto-select the dGPU through those graphics APIs. CUDA remains
-#     available normally through libcuda and /dev/nvidia*.
+#     cannot auto-select the dGPU through those graphics APIs.
+#   - GStreamer's NVIDIA codec and HIP plugins are disabled because their
+#     login-time scans open CUDA. Normal CUDA remains available through libcuda
+#     and /dev/nvidia*; only NVIDIA/HIP acceleration inside GStreamer is absent.
 #
 # Temporary driver/firmware workarounds:
 #   - Keep packaged fine runtime PM (0x02). A trial of coarse mode (0x01) caused
@@ -160,7 +162,7 @@ status hardware "NVIDIA GPU at $GPU_PCI"
 # filenames do not end in .json, so EGL and Vulkan loaders do not discover them.
 # We previously tried __EGL_VENDOR_LIBRARY_FILENAMES instead. Do not restore it
 # in /etc/environment: its host path is invalid inside confined snap namespaces.
-divert_graphics_manifest() {
+divert_nvidia_probe() {
     local source=$1
     local target=$2
     local legacy_target=${3:-}
@@ -197,13 +199,25 @@ divert_graphics_manifest() {
 EGL_SOURCE=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
 EGL_DISABLED=${EGL_SOURCE}.disabled
 EGL_LEGACY=/usr/share/glvnd/egl_vendor.d/90_nvidia.json
-divert_graphics_manifest "$EGL_SOURCE" "$EGL_DISABLED" "$EGL_LEGACY"
+divert_nvidia_probe "$EGL_SOURCE" "$EGL_DISABLED" "$EGL_LEGACY"
 status desktop "NVIDIA excluded from automatic EGL discovery"
 
 VULKAN_SOURCE=/usr/share/vulkan/icd.d/nvidia_icd.json
 VULKAN_DISABLED=${VULKAN_SOURCE}.disabled
-divert_graphics_manifest "$VULKAN_SOURCE" "$VULKAN_DISABLED"
+divert_nvidia_probe "$VULKAN_SOURCE" "$VULKAN_DISABLED"
 status desktop "NVIDIA excluded from automatic Vulkan discovery"
+
+# GDM's GNOME session scans GStreamer plugins before login. Both libgstnvcodec
+# and libgsthip load libgstcuda and call NVIDIA's CUDA driver while registering.
+# On 2026-07-14 each became the first NVIDIA client on consecutive boots and
+# blocked in RmInitAdapter/kgspInitRm. Disable both plugins; Intel, software, and
+# non-GStreamer CUDA paths stay available. These diversions survive upgrades of
+# gstreamer1.0-plugins-bad.
+for plugin in libgstnvcodec.so libgsthip.so; do
+    source=/usr/lib/x86_64-linux-gnu/gstreamer-1.0/$plugin
+    divert_nvidia_probe "$source" "${source}.disabled"
+done
+status desktop "NVIDIA excluded from automatic GStreamer codec/HIP probing"
 
 # GLX/PRIME: select Mesa for login paths, including Chrome PWAs. We tried
 # patching Chrome desktop files directly; package upgrades replaced the patches,
@@ -450,6 +464,13 @@ Future rollback after driver/firmware fixes:
       --divert /usr/share/vulkan/icd.d/nvidia_icd.json.disabled \
       /usr/share/vulkan/icd.d/nvidia_icd.json
       restores NVIDIA Vulkan discovery
+  sudo dpkg-divert --local --remove --rename \
+      --divert /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstnvcodec.so.disabled \
+      /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstnvcodec.so
+  sudo dpkg-divert --local --remove --rename \
+      --divert /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgsthip.so.disabled \
+      /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgsthip.so
+      restores NVIDIA/HIP acceleration inside GStreamer
   sudo rm /etc/modprobe.d/nvidia-runtimepm.conf
       delegates fine-grained runtime PM (0x02) to the packaged configuration
   sudo rm /etc/modprobe.d/nvidia-local.conf
