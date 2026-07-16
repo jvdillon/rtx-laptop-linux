@@ -271,6 +271,19 @@ status desktop "nvidia-settings autostart disabled for $REAL_USER"
 # ------------------------------------------------------------------------------
 # Runtime power policy
 # ------------------------------------------------------------------------------
+# NVIDIA's package supplies S0ix, video-memory preservation, /var/tmp storage,
+# and nouveau/nova blacklists in /usr/lib/modprobe.d/nvidia-graphics-drivers.conf.
+# Remove the obsolete local shadow so package updates remain authoritative.
+rm -f /etc/modprobe.d/nvidia-graphics-drivers.conf
+status power "packaged NVIDIA power-management policy retained"
+
+# Allow ordinary users to collect NVIDIA profiling metrics. This is intentional
+# for local CUDA development; remove the file to restore admin-only profiling.
+cat > /etc/modprobe.d/nvidia-profiling.conf << 'EOF'
+options nvidia NVreg_RestrictProfilingToAdminUsers=0
+EOF
+status driver "NVIDIA profiling allowed for ordinary users"
+
 # Nonblocking open has caused nv_open_q to spin at high CPU on this driver. This
 # option is temporary; remove it after NVIDIA fixes the open-path bug.
 # https://github.com/NVIDIA/open-gpu-kernel-modules/discussions/615
@@ -278,11 +291,6 @@ cat > /etc/modprobe.d/nvidia-local.conf << 'EOF'
 # Temporary nv_open_q spin workaround.
 options nvidia NVreg_EnableNonblockingOpen=0
 EOF
-# Remove the location used by older revisions of this script.
-LEGACY_OPTIONS=/etc/modprobe.d/nvidia-graphics-drivers.conf
-if [[ -f $LEGACY_OPTIONS ]]; then
-    sed -i '/^options nvidia .*NVreg_EnableNonblockingOpen=0/d' "$LEGACY_OPTIONS"
-fi
 status power "nonblocking NVIDIA open disabled"
 
 # NVIDIA packages select fine-grained runtime PM (0x02) in
@@ -305,10 +313,6 @@ cat > /etc/modprobe.d/nvidia-runtimepm.conf << 'EOF'
 # Fine runtime PM preserves D3cold. Do not retry coarse mode (0x01): it wedged.
 options nvidia NVreg_DynamicPowerManagement=0x02
 EOF
-# Remove the location briefly used by an older revision.
-if [[ -f $LEGACY_OPTIONS ]]; then
-    sed -i '/^options nvidia .*NVreg_DynamicPowerManagement=/d' "$LEGACY_OPTIONS"
-fi
 status power "fine runtime PM enabled (0x02) for D3cold"
 
 # Keep PCI runtime PM enabled for D3cold. The rule reapplies power/control=auto
