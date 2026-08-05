@@ -76,7 +76,16 @@ fi
 # 2. Compute apps (wakes the GPU; may hang if the driver is wedged)
 # ------------------------------------------------------------------------------
 if [[ $runtime_status == error ]]; then
-    printf '\nrutime_status=error: skipping nvidia-smi, it would hang.\n'
+    printf '\nruntime_status=error: skipping nvidia-smi, it would hang.\n'
+    exit 0
+fi
+
+# Every NVML compute app holds an open /dev/nvidia* fd, so no holders means the
+# query can only return an empty table. Skipping it keeps an idle GPU in D3cold:
+# the two nvidia-smi calls below cost ~4s and a wake for no information. Note the
+# fd scan only sees this user's processes unless run under sudo, so an idle
+# report is authoritative for a single-user machine.
+if [[ -z $holder_rows ]]; then
     exit 0
 fi
 
