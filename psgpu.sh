@@ -80,12 +80,12 @@ if [[ $runtime_status == error ]]; then
     exit 0
 fi
 
-# Every NVML compute app holds an open /dev/nvidia* fd, so no holders means the
-# query can only return an empty table. Skipping it keeps an idle GPU in D3cold:
-# the two nvidia-smi calls below cost ~4s and a wake for no information. Note the
-# fd scan only sees this user's processes unless run under sudo, so an idle
-# report is authoritative for a single-user machine.
-if [[ -z $holder_rows ]]; then
+# Skipping the query keeps an idle GPU in D3cold: the two nvidia-smi calls below
+# cost ~4s and a wake for no information. Empty holder_rows is NOT sufficient
+# evidence of idle -- the fd scan cannot read /proc/<pid>/fd of other users'
+# processes without sudo, so another user's compute job is invisible to it.
+# runtime_usage is the kernel's own reference count and sees every client.
+if [[ -z $holder_rows && ( $runtime_usage == 0 || $runtime_usage == '?' ) ]]; then
     exit 0
 fi
 
