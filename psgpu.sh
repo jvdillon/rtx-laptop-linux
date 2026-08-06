@@ -17,16 +17,32 @@
 
 set -uo pipefail
 
-GPU_PCI=0000:01:00.0
-SYSFS=/sys/bus/pci/devices/${GPU_PCI}
+# Every GPU bound to the nvidia driver, not just the first. Runtime PM state is
+# per-device: one card can be in D3cold while another is computing.
+mapfile -t GPU_PCI < <(
+    for dev in /sys/bus/pci/drivers/nvidia/0000:*; do
+        [[ -e $dev/power/runtime_status ]] && basename "$dev"
+    done
+)
 
 read_attr() {
-    cat "${SYSFS}/$1" 2>/dev/null || echo '?'
+    cat "/sys/bus/pci/devices/$1/$2" 2>/dev/null || echo '?'
 }
 
-runtime_status=$(read_attr power/runtime_status)
-power_state=$(read_attr power_state)
-runtime_usage=$(read_attr power/runtime_usage)
+# Aggregate across cards: any device in error blocks nvidia-smi, and any device
+# with a nonzero refcount means the driver is already awake, so querying it is
+# free.
+any_error=0
+total_usage=0
+power_lines=""
+for pci in "${GPU_PCI[@]}"; do
+    rs=$(read_attr "$pci" power/runtime_status)
+    ps=$(read_attr "$pci" power_state)
+    ru=$(read_attr "$pci" power/runtime_usage)
+    [[ $rs == error ]] && any_error=1
+    [[ $ru =~ ^[0-9]+$ ]] && ((total_usage += ru))
+    power_lines+="$pci|$rs|$ps|$ru"$'\n'
+done
 
 # ------------------------------------------------------------------------------
 # 1. Device holders (safe)
@@ -58,24 +74,28 @@ while read -r pid nodes; do
         "$pid" "$user" "$etime" "$((rss / 1024))MiB" "$nodes" "$full_cmd")$'\n'
 done <<< "$holders"
 
+while IFS='|' read -r pci rs ps ru; do
+    [[ -z $pci ]] && continue
+    if [[ $ru == 0 || $ru == '?' ]]; then
+        printf 'GPU %s: %s (%s), no clients\n' "$pci" "$rs" "$ps"
+    else
+        printf 'GPU %s: %s (%s), runtime_usage=%s\n' "$pci" "$rs" "$ps" "$ru"
+    fi
+done <<< "$power_lines"
+
 if [[ -n $holder_rows ]]; then
-    printf 'GPU %s: %s (%s), runtime_usage=%s\n\n' \
-        "$GPU_PCI" "$runtime_status" "$power_state" "$runtime_usage"
+    scope='all users'
+    [[ $EUID -ne 0 ]] && scope="$(id -un) only; /proc/<pid>/fd is unreadable for other users -- run under sudo for all"
+    printf '\nHOLDERS (open /dev/nvidia* fds; %s)\n' "$scope"
     printf '%-8s %-10s %-8s %-9s %-26s %s\n' \
         PID USER TIME RSS NODES COMMAND
     printf '%s' "$holder_rows"
-elif [[ $runtime_usage == 0 || $runtime_usage == '?' ]]; then
-    printf 'GPU %s: %s (%s), no clients\n' "$GPU_PCI" "$runtime_status" "$power_state"
-else
-    # No userspace holder yet runtime PM is pinned: a kernel-side reference.
-    printf 'GPU %s: %s (%s), no client fds but runtime_usage=%s\n' \
-        "$GPU_PCI" "$runtime_status" "$power_state" "$runtime_usage"
 fi
 
 # ------------------------------------------------------------------------------
 # 2. Compute apps (wakes the GPU; may hang if the driver is wedged)
 # ------------------------------------------------------------------------------
-if [[ $runtime_status == error ]]; then
+if (( any_error )); then
     printf '\nruntime_status=error: skipping nvidia-smi, it would hang.\n'
     exit 0
 fi
@@ -85,7 +105,7 @@ fi
 # evidence of idle -- the fd scan cannot read /proc/<pid>/fd of other users'
 # processes without sudo, so another user's compute job is invisible to it.
 # runtime_usage is the kernel's own reference count and sees every client.
-if [[ -z $holder_rows && ( $runtime_usage == 0 || $runtime_usage == '?' ) ]]; then
+if [[ -z $holder_rows ]] && (( total_usage == 0 )); then
     exit 0
 fi
 
@@ -97,12 +117,20 @@ while IFS=', ' read -r idx uuid util mem_used _; do
 done < <(nvidia-smi --query-gpu=index,uuid,utilization.gpu,memory.used,memory.total \
     --format=csv,noheader,nounits 2>/dev/null)
 
+gpu_rows=""
+for uuid in "${!gpu_index[@]}"; do
+    gpu_rows+=$(printf '%-4s %-6s %s' \
+        "${gpu_index[$uuid]}" "${gpu_util[$uuid]}%" "${gpu_mem_used[$uuid]}MiB")$'\n'
+done
+gpu_rows=$(sort -n <<< "${gpu_rows%$'\n'}")
+
+# MEM here is this process's own VRAM, distinct from the per-GPU total above.
+# There is no per-process utilization: NVML only exposes it with accounting mode
+# enabled, which requires root and is off by default (accounting.mode=Disabled).
 compute_rows=""
-while IFS=', ' read -r pid proc uuid _; do
+while IFS=', ' read -r pid proc uuid mem_used; do
     [[ -z $pid ]] && continue
     idx=${gpu_index[$uuid]:-'?'}
-    util=${gpu_util[$uuid]:-'?'}
-    mem_used=${gpu_mem_used[$uuid]:-'?'}
     read -r elapsed full_cmd < <(ps -p "$pid" -o etimes=,args= 2>/dev/null)
     if [[ -n $elapsed ]]; then
         etime=$(printf '%dh%02dm' $((elapsed / 3600)) $(((elapsed % 3600) / 60)))
@@ -110,12 +138,18 @@ while IFS=', ' read -r pid proc uuid _; do
         etime='?'
         full_cmd=$(basename "$proc")
     fi
-    compute_rows+=$(printf '%-4s %-8s %-6s %-9s %-8s %s' \
-        "$idx" "$pid" "${util}%" "${mem_used}MiB" "$etime" "$full_cmd")$'\n'
+    compute_rows+=$(printf '%-4s %-8s %-9s %-8s %s' \
+        "$idx" "$pid" "${mem_used}MiB" "$etime" "$full_cmd")$'\n'
 done < <(nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid,used_memory \
     --format=csv,noheader,nounits 2>/dev/null)
 
+if [[ -n $gpu_rows ]]; then
+    printf '\n%-4s %-6s %s\n' GPU UTIL MEM
+    printf '%s\n' "$gpu_rows"
+fi
+
 if [[ -n $compute_rows ]]; then
-    printf '\n%-4s %-8s %-6s %-9s %-8s %s\n' GPU PID UTIL MEM TIME COMMAND
+    printf '\nCOMPUTE (NVML; all users)\n'
+    printf '%-4s %-8s %-9s %-8s %s\n' GPU PID MEM TIME COMMAND
     printf '%s' "$compute_rows"
 fi
