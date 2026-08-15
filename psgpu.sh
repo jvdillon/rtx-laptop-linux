@@ -29,6 +29,60 @@ read_attr() {
     cat "/sys/bus/pci/devices/$1/$2" 2>/dev/null || echo '?'
 }
 
+# tput falls back to the terminfo width (80) when stdout is a pipe, which is the
+# right answer there anyway.
+TERM_WIDTH=$(tput cols 2>/dev/null) || TERM_WIDTH=100
+(( TERM_WIDTH < 60 )) && TERM_WIDTH=60
+
+# Where COMMAND starts in each table: the sum of the preceding printf widths
+# plus their separating spaces. Kept next to the format strings they mirror.
+HOLDER_CMD_COL=66   # 8 +1+ 10 +1+ 8 +1+ 9 +1+ 26 +1
+COMPUTE_CMD_COL=44  # 4 +1+ 8 +1+ 10 +1+ 9 +1+ 8 +1
+
+# Emit "<prefix><command>" with the command greedy-wrapped inside its own column:
+# continuation lines are indented to $col so the table keeps its shape. The
+# prefix is measured rather than assumed to equal $col, since an over-long
+# earlier field (NODES, say) pushes the first line right.
+wrap_row() {
+    local prefix=$1 col=$2 text=$3
+    local pad
+    printf -v pad '%*s' "$col" ''
+    # Never let a wide prefix drive the text column to zero: the hard-break loop
+    # below would spin forever on a zero-width slice.
+    local textw=$((TERM_WIDTH - col))
+    (( textw < 20 )) && textw=20
+    local avail=$((TERM_WIDTH - ${#prefix})) line='' out='' word
+    (( avail < 20 )) && avail=20
+    local -a words
+    read -ra words <<< "$text"
+    for word in "${words[@]}"; do
+        # A single token wider than the column (long paths) is hard-broken.
+        while (( ${#word} > avail )); do
+            if [[ -n $line ]]; then
+                out+="$prefix$line"$'\n'
+            else
+                out+="$prefix${word:0:avail}"$'\n'
+                word=${word:avail}
+            fi
+            line=''
+            prefix=$pad
+            avail=$textw
+        done
+        if [[ -z $line ]]; then
+            line=$word
+        elif (( ${#line} + 1 + ${#word} <= avail )); then
+            line+=" $word"
+        else
+            out+="$prefix$line"$'\n'
+            line=$word
+            prefix=$pad
+            avail=$textw
+        fi
+    done
+    [[ -n $line ]] && out+="$prefix$line"$'\n'
+    printf '%s' "$out"
+}
+
 # Aggregate across cards: any device in error blocks nvidia-smi, and any device
 # with a nonzero refcount means the driver is already awake, so querying it is
 # free.
@@ -70,8 +124,9 @@ while read -r pid nodes; do
     [[ -z $user ]] && continue
     etime=$(printf '%dh%02dm' $((elapsed / 3600)) $(((elapsed % 3600) / 60)))
     # RSS is host memory, not VRAM; the kernel exposes no per-process VRAM.
-    holder_rows+=$(printf '%-8s %-10s %-8s %-9s %-26s %s' \
-        "$pid" "$user" "$etime" "$((rss / 1024))MiB" "$nodes" "$full_cmd")$'\n'
+    printf -v prefix '%-8s %-10s %-8s %-9s %-26s ' \
+        "$pid" "$user" "$etime" "$((rss / 1024))MiB" "$nodes"
+    holder_rows+=$(wrap_row "$prefix" "$HOLDER_CMD_COL" "$full_cmd")$'\n'
 done <<< "$holders"
 
 while IFS='|' read -r pci rs ps ru; do
@@ -131,15 +186,19 @@ compute_rows=""
 while IFS=', ' read -r pid proc uuid mem_used; do
     [[ -z $pid ]] && continue
     idx=${gpu_index[$uuid]:-'?'}
-    read -r elapsed full_cmd < <(ps -p "$pid" -o etimes=,args= 2>/dev/null)
+    read -r user elapsed full_cmd < <(ps -p "$pid" -o user=,etimes=,args= 2>/dev/null)
     if [[ -n $elapsed ]]; then
         etime=$(printf '%dh%02dm' $((elapsed / 3600)) $(((elapsed % 3600) / 60)))
     else
+        # NVML sees every user's compute apps, but the process may have exited
+        # between the query and here.
+        user='?'
         etime='?'
         full_cmd=$(basename "$proc")
     fi
-    compute_rows+=$(printf '%-4s %-8s %-9s %-8s %s' \
-        "$idx" "$pid" "${mem_used}MiB" "$etime" "$full_cmd")$'\n'
+    printf -v prefix '%-4s %-8s %-10s %-9s %-8s ' \
+        "$idx" "$pid" "$user" "${mem_used}MiB" "$etime"
+    compute_rows+=$(wrap_row "$prefix" "$COMPUTE_CMD_COL" "$full_cmd")$'\n'
 done < <(nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid,used_memory \
     --format=csv,noheader,nounits 2>/dev/null)
 
@@ -150,6 +209,6 @@ fi
 
 if [[ -n $compute_rows ]]; then
     printf '\nCOMPUTE (NVML; all users)\n'
-    printf '%-4s %-8s %-9s %-8s %s\n' GPU PID MEM TIME COMMAND
+    printf '%-4s %-8s %-10s %-9s %-8s %s\n' GPU PID USER MEM TIME COMMAND
     printf '%s' "$compute_rows"
 fi
