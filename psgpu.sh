@@ -164,18 +164,38 @@ if [[ -z $holder_rows ]] && (( total_usage == 0 )); then
     exit 0
 fi
 
-declare -A gpu_index gpu_util gpu_mem_used
-while IFS=', ' read -r idx uuid util mem_used _; do
+# Thermals come from NVML, not /sys: the proprietary driver registers no hwmon
+# node (only nouveau does), so there is no sysfs source to read them from.
+# Fields absent on a given board (temperature.memory outside datacenter parts,
+# fan.speed on passively cooled ones) come back as [N/A] and print as '-'.
+declare -A gpu_index gpu_util gpu_mem_used gpu_temp gpu_fan gpu_power
+while IFS=', ' read -r idx uuid util mem_used _ temp fan power; do
     gpu_index[$uuid]=$idx
     gpu_util[$uuid]=$util
     gpu_mem_used[$uuid]=$mem_used
-done < <(nvidia-smi --query-gpu=index,uuid,utilization.gpu,memory.used,memory.total \
+    gpu_temp[$uuid]=$temp
+    gpu_fan[$uuid]=$fan
+    gpu_power[$uuid]=$power
+done < <(nvidia-smi \
+    --query-gpu=index,uuid,utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed,power.draw \
     --format=csv,noheader,nounits 2>/dev/null)
+
+# nvidia-smi spells unsupported fields '[N/A]'; a bare unit suffix on that would
+# read as a real measurement.
+fmt_field() {
+    [[ $1 == '[N/A]' || -z $1 ]] && { printf -- '-'; return; }
+    printf '%s%s' "$1" "$2"
+}
 
 gpu_rows=""
 for uuid in "${!gpu_index[@]}"; do
-    gpu_rows+=$(printf '%-4s %-6s %s' \
-        "${gpu_index[$uuid]}" "${gpu_util[$uuid]}%" "${gpu_mem_used[$uuid]}MiB")$'\n'
+    gpu_rows+=$(printf '%-4s %-6s %-10s %-6s %-6s %s' \
+        "${gpu_index[$uuid]}" \
+        "$(fmt_field "${gpu_util[$uuid]}" '%')" \
+        "$(fmt_field "${gpu_mem_used[$uuid]}" 'MiB')" \
+        "$(fmt_field "${gpu_temp[$uuid]}" 'C')" \
+        "$(fmt_field "${gpu_fan[$uuid]}" '%')" \
+        "$(fmt_field "${gpu_power[$uuid]}" 'W')")$'\n'
 done
 gpu_rows=$(sort -n <<< "${gpu_rows%$'\n'}")
 
@@ -203,7 +223,7 @@ done < <(nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid,used_memory \
     --format=csv,noheader,nounits 2>/dev/null)
 
 if [[ -n $gpu_rows ]]; then
-    printf '\n%-4s %-6s %s\n' GPU UTIL MEM
+    printf '\n%-4s %-6s %-10s %-6s %-6s %s\n' GPU UTIL MEM TEMP FAN POWER
     printf '%s\n' "$gpu_rows"
 fi
 
